@@ -1,6 +1,11 @@
+from __future__ import annotations
+
+import hashlib
+from contextvars import ContextVar
+CURRENT_SESSION_KEY: ContextVar[str | None] = ContextVar('CURRENT_SESSION_KEY', default=None)
+
 """OpenAI-compatible request/response schemas and message conversion helpers."""
 
-from __future__ import annotations
 
 import base64
 import binascii
@@ -81,6 +86,13 @@ def _decode_image_part(url: str) -> bytes | None:
     return None
 
 
+def _compact_system(txt: str) -> str:
+    if "# TOOLS" in txt:
+        idx = txt.index("# TOOLS")
+        head = txt[:idx].strip()
+        return (head[:1200] + "\n\n" + txt[idx:]) if len(head) > 1200 else txt
+    return txt[:2000]
+
 def flatten_messages(messages: list[ChatMessage]) -> tuple[str, list[bytes]]:
     """Collapse an OpenAI message list into (prompt, image_files).
 
@@ -127,10 +139,21 @@ def flatten_messages(messages: list[ChatMessage]) -> tuple[str, list[bytes]]:
 
         turns.append((m.role, text))
 
-    # Fast path: a single user message (optionally with a system message).
     non_empty = [(r, t) for r, t in turns if t.strip() or r == "user"]
+    sys_seed = "\n\n".join(t for r, t in non_empty if r == "system")
+    first_usr = next((t for r, t in non_empty if r == "user"), "")
+    s_hash = hashlib.sha256(f"{sys_seed[:500]}|{first_usr}".encode("utf-8")).hexdigest()[:16]
+    CURRENT_SESSION_KEY.set(s_hash)
+
+    # Incremental path: if conversation already has assistant/tool turns, send ONLY the latest turn
+    non_sys = [t for t in non_empty if t[0] != "system"]
+    if len(non_sys) > 1:
+        last_role, last_txt = non_sys[-1]
+        return last_txt.strip(), files
+
+    # Fast path: a single user message (optionally with a system message).
     if len([t for t in non_empty if t[0] not in ("system",)]) == 1:
-        sys_txt = "\n\n".join(t for r, t in turns if r == "system" and t.strip())
+        sys_txt = _compact_system("\n\n".join(t for r, t in turns if r == "system" and t.strip()))
         usr_txt = "\n\n".join(t for r, t in turns if r not in ("system",) and t.strip())
         prompt = f"{sys_txt}\n\n{usr_txt}".strip() if sys_txt else usr_txt
         return prompt, files

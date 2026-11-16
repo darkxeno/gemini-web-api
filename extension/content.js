@@ -213,7 +213,24 @@
     sel.addRange(range);
     document.execCommand("delete", false);
     // insertText keeps newlines; do it in one shot.
-    const ok = document.execCommand("insertText", false, text);
+    let ok = false;
+    try {
+      const CHUNK = 8000;
+      for (let i = 0; i < text.length; i += CHUNK) {
+        const slice = text.slice(i, i + CHUNK);
+        const dt = new DataTransfer();
+        dt.setData("text/plain", slice);
+        el.dispatchEvent(new ClipboardEvent("paste", {
+          clipboardData: dt,
+          bubbles: true,
+          cancelable: true
+        }));
+      }
+      ok = (el.textContent || "").trim().length >= Math.min(text.trim().length, 20);
+    } catch (_) {}
+    if (!ok) {
+      ok = document.execCommand("insertText", false, text);
+    }
     if (!ok) {
       // fallback: set innerText + fire input
       el.innerText = text;
@@ -236,25 +253,49 @@
     // ~1.6s stable + no stop button, or ~4s stable regardless of the button.
     let last = "";
     let stable = 0;
+    let streamActive = false;
+    let streamCompleted = false;
+    const onStreamState = (ev) => {
+      const active = !!(ev.detail && ev.detail.active);
+      if (active) {
+        streamActive = true;
+      } else if (streamActive) {
+        streamActive = false;
+        streamCompleted = true;
+      }
+    };
+    window.addEventListener("gemini-stream-state", onStreamState);
+
     const t0 = Date.now();
     const HARD = 290000;
-    for (;;) {
-      dismissOnboarding(); // the "Keep in mind" notice can pop mid-response
-      const nodes = responseNodes();
-      const node = nodes[nodes.length - 1];
-      const text = node ? (node.innerText || "").trim() : "";
-      if (onDelta && text && text !== last) onDelta(text);
-      const generating = !!findStopButton();
-      if (text && text === last) {
-        stable += 1;
-      } else {
-        stable = 0;
+    try {
+      for (;;) {
+        dismissOnboarding();
+        const nodes = responseNodes();
+        const node = nodes[nodes.length - 1];
+        const text = node ? (node.innerText || "").trim() : "";
+        if (onDelta && text && text !== last) onDelta(text);
+
+        if (streamCompleted && text) {
+          await sleep(200);
+          const finalNodes = responseNodes();
+          const finalNode = finalNodes[finalNodes.length - 1];
+          return (finalNode ? (finalNode.innerText || "").trim() : "") || text;
+        }
+
+        if (!streamActive && !streamCompleted) {
+          const generating = !!findStopButton();
+          if (text && text === last) stable += 1;
+          else stable = 0;
+          if (text && stable >= 8 && !generating) return text;
+        }
+
+        last = text;
+        if (Date.now() - t0 > HARD) return text || "";
+        await sleep(150);
       }
-      last = text;
-      if (text && stable >= 4 && !generating) return text;
-      if (text && stable >= 10) return text;
-      if (Date.now() - t0 > HARD) return text || "";
-      await sleep(400);
+    } finally {
+      window.removeEventListener("gemini-stream-state", onStreamState);
     }
   }
 

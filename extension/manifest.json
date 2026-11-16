@@ -9,6 +9,16 @@
         "https://gemini.google.com/*"
       ],
       "js": [
+        "net_hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
         "content.js"
       ],
       "run_at": "document_idle"

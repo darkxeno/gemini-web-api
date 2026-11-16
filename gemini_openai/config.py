@@ -189,6 +189,11 @@ def get_cookies() -> tuple[str | None, str | None]:
     if psid:
         return psid, psidts
 
+    if CDP_URL:
+        jar = cookies_via_cdp()
+        if jar.get("__Secure-1PSID"):
+            return jar.get("__Secure-1PSID"), jar.get("__Secure-1PSIDTS")
+
     try:
         import browser_cookie3
     except ImportError:
@@ -232,6 +237,10 @@ def get_full_jar() -> dict[str, str]:
     """
     if os.getenv("GEMINI_1PSID"):
         return {}
+    if CDP_URL:
+        jar = cookies_via_cdp()
+        if jar:
+            return jar
     try:
         import browser_cookie3
     except ImportError:

@@ -331,7 +331,7 @@ async def _run_generation(req: ChatCompletionRequest):
         prompt,
         files=files or None,
         model=model,
-        temporary=True,  # keep the user's Gemini history clean
+        temporary=False,  # keep the user's Gemini history clean
     )
     text = render_output(output)
 
@@ -405,7 +405,7 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
         final_output = None
         try:
             async for out in pick_manager(has_files=bool(files)).generate_stream(
-                prompt, files=files or None, model=model, temporary=True
+                prompt, files=files or None, model=model, temporary=False
             ):
                 final_output = out
                 delta = out.text_delta or ""
@@ -498,7 +498,7 @@ async def images_generations(body: dict, request: Request, _=Depends(check_key))
         if prof != str(config.AUTHUSER or "0"):
             await video_mod._switch_profile(manager, prof)
         tried.append(prof)
-        output = await manager.generate(instruction, model=model, temporary=True)
+        output = await manager.generate(instruction, model=model, temporary=False)
         data = [
             {"url": await _local_url(img.url, request), "revised_prompt": getattr(img, "title", None)}
             for img in (getattr(output, "images", []) or [])

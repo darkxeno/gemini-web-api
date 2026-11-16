@@ -47,9 +47,13 @@ def build_tools_prompt(tools: list[dict[str, Any]], tool_choice: Any = None) -> 
         name = fn.get("name", "")
         if not name:
             continue
-        desc = (fn.get("description") or "").strip()
-        params = fn.get("parameters") or {"type": "object", "properties": {}}
-        lines.append(f"- {name}: {desc}\n  parameters (JSON Schema): {json.dumps(params)}")
+        desc = (fn.get("description") or "").strip().splitlines()[0][:120] if fn.get("description") else ""
+        raw_params = fn.get("parameters") or {"type": "object", "properties": {}}
+        props = {k: {"type": v.get("type", "string")} for k, v in (raw_params.get("properties") or {}).items()}
+        compact_params = {"type": "object", "properties": props}
+        if raw_params.get("required"):
+            compact_params["required"] = raw_params["required"]
+        lines.append(f"- {name} ({desc}): {json.dumps(compact_params, separators=(',', ':'))}")
     tool_list = "\n".join(lines)
 
     # tool_choice handling: "required"/{"type":"function",...} forces a call.

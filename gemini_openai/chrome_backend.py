@@ -1,3 +1,22 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+SESSION_MAP_FILE = Path("/tmp/gemini-session-map.json")
+
+def _load_session_map() -> dict[str, str]:
+    try:
+        return json.loads(SESSION_MAP_FILE.read_text(encoding="utf-8")) if SESSION_MAP_FILE.exists() else {}
+    except Exception:
+        return {}
+
+def _save_session_map(data: dict[str, str]) -> None:
+    try:
+        SESSION_MAP_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+from .openai_schemas import CURRENT_SESSION_KEY
 """Chrome-extension backend: drive logged-in gemini.google.com tabs.
 
 An alternative to the cookie/CDP gemini_webapi backend (gemini_pool.py). Instead
@@ -25,7 +44,6 @@ WS protocol (server <-> extension):
                     {"type":"delta","id","text"} | {"type":"result","id","text","media"?}
                     {"type":"error","id","message"}
 """
-from __future__ import annotations
 
 import asyncio
 import json
@@ -142,12 +160,51 @@ class Hub:
         so two acquirers can never grab the same tab. `exclude_key` skips the tab
         a failed attempt just ran on (retry-elsewhere).
         """
+        if not hasattr(self, "session_tabs"):
+            self.session_tabs: dict[str, int] = {}
+        sess_key = CURRENT_SESSION_KEY.get()
+        if exclude_key is not None and sess_key and self.session_tabs.get(sess_key) == exclude_key:
+            self.session_tabs.pop(sess_key, None)
+
         deadline = time.time() + ACQUIRE_TIMEOUT
         while True:
+            # Limpiar sesiones cuya pestaña se cerró o recargó
+            for sk, tk in list(self.session_tabs.items()):
+                if tk not in self.conns or not self.conns[tk].eligible:
+                    self.session_tabs.pop(sk, None)
+
+            pinned_key = self.session_tabs.get(sess_key) if sess_key else None
+            if pinned_key is None and sess_key:
+                saved_url = _load_session_map().get(sess_key)
+                if saved_url:
+                    match = next((c for c in self.conns.values() if c.eligible and saved_url in c.href), None)
+                    if match:
+                        self.session_tabs[sess_key] = match.key
+                        pinned_key = match.key
+            if pinned_key is not None and pinned_key in self.conns:
+                pinned_conn = self.conns[pinned_key]
+                if not pinned_conn.busy:
+                    pinned_conn.busy = True
+                    return pinned_conn
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise RuntimeError(f"pinned tab {pinned_conn.tab_id} busy for {ACQUIRE_TIMEOUT:.0f}s")
+                self._changed.clear()
+                try:
+                    await asyncio.wait_for(self._changed.wait(), timeout=min(remaining, 5.0))
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            reserved_keys = set(self.session_tabs.values())
             pool = [c for c in self.conns.values()
-                    if c.eligible and c.key != exclude_key]
+                    if c.eligible and c.key != exclude_key and c.key not in reserved_keys]
+            if not pool:
+                # Solo compartir pestañas libres si no hay ninguna sin reservar
+                pool = [c for c in self.conns.values()
+                        if c.eligible and c.key != exclude_key and not c.busy]
             if not pool and exclude_key is not None:
-                pool = [c for c in self.conns.values() if c.eligible]  # only choice
+                pool = [c for c in self.conns.values() if c.eligible]
             if not pool:
                 raise RuntimeError(
                     "no eligible gemini tab connected -- open a FRESH "
@@ -169,8 +226,12 @@ class Hub:
             if free:
                 # Newest connection first: freshly (re)loaded tabs are the least
                 # likely to be stale, throttled, or stuck in a bad UI state.
-                conn = max(free, key=lambda c: c.connected_at)
+                # Priorizar pestañas que aún están en /app limpio (sin conversación iniciada)
+                fresh_tabs = [c for c in free if "/app/" not in c.href]
+                conn = max(fresh_tabs or free, key=lambda c: c.connected_at)
                 conn.busy = True
+                if sess_key:
+                    self.session_tabs[sess_key] = conn.key
                 return conn
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -247,7 +308,7 @@ class ChromeManager:
         msg = str(exc)
         return any(sig in msg for sig in self.TAB_SHAPED)
 
-    async def generate(self, prompt, files=None, model=None, temporary=True,
+    async def generate(self, prompt, files=None, model=None, temporary=False,
                        authuser: str | None = None, _exclude: int | None = None):
         if files:
             raise RuntimeError("the chrome backend does not support file/vision input yet")
@@ -408,7 +469,7 @@ class ChromeManager:
             raise RuntimeError("extension returned no media")
         return media, (msg.get("text", "") if isinstance(msg, dict) else "")
 
-    async def generate_stream(self, prompt, files=None, model=None, temporary=True,
+    async def generate_stream(self, prompt, files=None, model=None, temporary=False,
                               authuser: str | None = None):
         if files:
             raise RuntimeError("the chrome backend does not support file/vision input yet")
@@ -478,6 +539,15 @@ def register_ws(app: FastAPI) -> None:
                 if mtype == "hello":
                     conn.tab_id = str(msg.get("tabId") or conn.tab_id)
                     conn.href = str(msg.get("href") or "")
+                    if "/app/" in conn.href and hasattr(hub, "session_tabs"):
+                        smap = _load_session_map()
+                        changed = False
+                        for sk, tk in hub.session_tabs.items():
+                            if tk == conn.key and smap.get(sk) != conn.href:
+                                smap[sk] = conn.href
+                                changed = True
+                        if changed:
+                            _save_session_map(smap)
                     au = msg.get("authuser")
                     if au is None:
                         # Older content scripts don't send authuser; the tab URL
