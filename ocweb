@@ -85,15 +85,15 @@ ensure_opencode_config() {
   cat > "$OPENCODE_CONFIG_FILE" <<JSON
 {
   "\$schema": "https://opencode.ai/config.json",
-  "model": "gemini-web/gemini-3-flash",
+  "model": "gemini-web/gemini-4-hydrogen",
   "provider": {
     "gemini-web": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Gemini Web (local)",
       "options": { "baseURL": "http://localhost:$PROXY_PORT/v1", "apiKey": "not-needed" },
       "models": {
-        "gemini-3-flash": { "name": "Gemini 3 Flash", "tools": true },
-        "gemini-3-pro": { "name": "Gemini 3 Pro", "tools": true }
+        "gemini-4-hydrogen": { "name": "Gemini 4 Hydrogen", "tools": true },
+        "gemini-flash-lite": { "name": "Gemini 3.5 Flash-Lite (rápido)", "tools": true }
       }
     }
   }

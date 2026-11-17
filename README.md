@@ -109,6 +109,16 @@ with the full prompt. Sessions run in parallel.
 `POST /v1/cookies` replaces the Google session every chat uses, so it is accepted
 only from this machine, as JSON, and without a web page's `Origin`.
 
+Models in `api` mode are the account's own: `/v1/models` lists its registry
+(`gemini-4-hydrogen`, `gemini-flash-lite`, ...) with Google's descriptions, the default
+first, and those names are passed through as-is. The default is `gemini-4-hydrogen`
+("4 Hydrogen", the web app's default; `GEMINI_DEFAULT_MODEL` overrides it). Avoid
+`gemini-pro` where it is "Investigación detallada" (deep research: slow, sometimes no
+reply) and Argon (`95a4c0abcba24364`, listed as `gemini-carbon`): it stalls over the
+library's `StreamGenerate` since Google's 2026-11-12 web build, while the web app now
+sends messages through `geminiweb-pa.clients6.google.com/v1/processSession`
+([gemini-webapi #374](https://github.com/HanaokaYuzu/Gemini-API/issues/374)).
+
 [`ocweb`](ocweb) (run it from the repo, or symlink it onto your PATH) launches
 OpenCode on this setup -- on first run it opens the profile's Chromium to sign in
 to Google; it starts the proxy in `api` mode if none is running, starts the cookie

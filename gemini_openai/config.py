@@ -393,7 +393,13 @@ _ALIASES: dict[str, str] = {
     "gpt-3.5-turbo": "gemini-3-flash",
 }
 
-DEFAULT_MODEL = "gemini-3-flash"
+# api mode defaults to 4 Hydrogen ("Ayuda en tu día a día"), the web app's own default:
+# measured 2026-11-17, `gemini-3-pro` resolves to deep research ("Investigación
+# detallada") and `gemini-3-flash` to Flash-Lite, and Argon stalls over the library's
+# StreamGenerate (gemini-webapi issue #374). GEMINI_DEFAULT_MODEL overrides either.
+DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL") or (
+    "gemini-4-hydrogen" if BACKEND == "api" else "gemini-3-flash"
+)
 
 
 def resolve_model(name: str | None) -> str:
@@ -406,7 +412,13 @@ def resolve_model(name: str | None) -> str:
         return _ALIASES[key]
     # tolerate names with provider prefixes like "models/gemini-3-pro"
     key2 = key.split("/")[-1]
-    return _CANON.get(key2) or _ALIASES.get(key2) or DEFAULT_MODEL
+    known = _CANON.get(key2) or _ALIASES.get(key2)
+    if known:
+        return known
+    # api mode: the account's own model names (gemini-4-hydrogen, gemini-flash-lite...)
+    # go to the library, which resolves them against the account's registry and falls
+    # back to the account's default (logged) when it has no such model.
+    return key2 if BACKEND == "api" else DEFAULT_MODEL
 
 
 def list_public_models() -> list[str]:

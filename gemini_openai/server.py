@@ -240,9 +240,25 @@ def render_output(output) -> str:
 @app.get("/v1/models")
 async def list_models(_=Depends(check_key)) -> dict:
     now = int(time.time())
+    names, described = config.list_public_models(), {}
+    if config.BACKEND == "api":
+        # The account's own registry (what Google offers this account), not the static
+        # names: those map badly (gemini-3-pro is deep research on some accounts).
+        try:
+            client = await asyncio.wait_for(webapi_manager.get(), 30)
+            account = [m for m in (client.list_models() or []) if m.is_available]
+            if account:
+                names = [m.model_name for m in account]
+                described = {m.model_name: f"{m.description} ({m.display_name})" for m in account}
+        except Exception as e:  # noqa: BLE001
+            print(f"[models] account registry unavailable ({type(e).__name__}: {e}); "
+                  f"listing the static names", flush=True)
+    # The default first: clients that pick the first model get the one that works.
+    names = sorted(names, key=lambda n: n != config.DEFAULT_MODEL)
     data = [
-        {"id": name, "object": "model", "created": now, "owned_by": "google-gemini"}
-        for name in config.list_public_models()
+        {"id": name, "object": "model", "created": now, "owned_by": "google-gemini",
+         **({"description": described[name]} if name in described else {})}
+        for name in names
     ]
     return {"object": "list", "data": data}
 

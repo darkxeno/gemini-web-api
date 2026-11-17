@@ -404,3 +404,50 @@ def test_health_says_whether_cookies_came_since_this_server_started(api, monkeyp
     assert asyncio.run(server.health())["cookies_pushed_since_start"] is False
     push(client)
     assert asyncio.run(server.health())["cookies_pushed_since_start"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Models: the account's own, Hydrogen by default
+# --------------------------------------------------------------------------- #
+def test_api_mode_passes_the_accounts_model_names_through():
+    assert config.resolve_model("gemini-4-hydrogen") == "gemini-4-hydrogen"
+    assert config.resolve_model("models/gemini-flash-lite") == "gemini-flash-lite"
+    assert config.resolve_model("gemini-3-flash") == "gemini-3-flash"  # the table still wins
+
+
+def test_other_modes_keep_unknown_names_on_the_default(monkeypatch):
+    monkeypatch.setattr(config, "BACKEND", "webapi")
+    assert config.resolve_model("gemini-4-hydrogen") == config.DEFAULT_MODEL
+
+
+class FakeRegistryModel:
+    def __init__(self, name, description, display, available=True):
+        self.model_name, self.description = name, description
+        self.display_name, self.is_available = display, available
+
+
+def test_api_mode_lists_the_accounts_models_default_first(monkeypatch):
+    registry = [FakeRegistryModel("gemini-flash-lite", "3.5 Flash-Lite", "Respuestas rápidas"),
+                FakeRegistryModel("gemini-4-hydrogen", "4 Hydrogen", "Ayuda en tu día a día"),
+                FakeRegistryModel("gemini-hidden", "x", "x", available=False)]
+    client = type("C", (), {"list_models": lambda self: registry})()
+
+    class Manager:
+        async def get(self):
+            return client
+
+    monkeypatch.setattr(server, "webapi_manager", Manager())
+    monkeypatch.setattr(config, "DEFAULT_MODEL", "gemini-4-hydrogen")
+    data = asyncio.run(server.list_models())["data"]
+    assert [m["id"] for m in data] == ["gemini-4-hydrogen", "gemini-flash-lite"]
+    assert data[0]["description"] == "4 Hydrogen (Ayuda en tu día a día)"
+
+
+def test_without_a_client_models_fall_back_to_the_static_names(monkeypatch):
+    class Manager:
+        async def get(self):
+            raise gp.AuthError("no cookies pushed yet")
+
+    monkeypatch.setattr(server, "webapi_manager", Manager())
+    ids = [m["id"] for m in asyncio.run(server.list_models())["data"]]
+    assert set(ids) == set(config.list_public_models())
