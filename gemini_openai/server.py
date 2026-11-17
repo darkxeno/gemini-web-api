@@ -238,11 +238,20 @@ async def list_models(_=Depends(check_key)) -> dict:
 
 @app.get("/health")
 async def health() -> dict:
+    tabs = _chrome_hub.tabs()
+    reserved = set(getattr(_chrome_hub, "session_tabs", {}).values())
+    eligible_tabs = [t for t in tabs if t.get("eligible")]
+    free_tabs = [
+        c for c in _chrome_hub.conns.values()
+        if c.eligible and not c.busy and c.key not in reserved
+    ]
     return {
         "status": "ok",
         "backend_mode": config.BACKEND,          # auto | webapi | chrome
         "active_backend": active_backend_name(),  # which one handles chat right now
         "extension_connected": _chrome_hub.online(),
+        "eligible_tabs": len(eligible_tabs),
+        "free_tabs": len(free_tabs),
     }
 
 

@@ -199,8 +199,8 @@ class Hub:
             reserved_keys = set(self.session_tabs.values())
             pool = [c for c in self.conns.values()
                     if c.eligible and c.key != exclude_key and c.key not in reserved_keys]
-            if not pool:
-                # Solo compartir pestañas libres si no hay ninguna sin reservar
+            if not pool and not sess_key:
+                # Solo compartir pestañas libres para peticiones sin sesión (ej. media o stateless)
                 pool = [c for c in self.conns.values()
                         if c.eligible and c.key != exclude_key and not c.busy]
             if not pool and exclude_key is not None:
@@ -563,6 +563,19 @@ def register_ws(app: FastAPI) -> None:
                         )
                     print(f"[hub] hello {conn.tab_id} u/{conn.authuser} "
                           f"eligible={conn.eligible} {conn.href[:60]}", flush=True)
+                    continue
+                if mtype == "url_changed":
+                    conn.href = str(msg.get("href") or conn.href)
+                    if "/app/" in conn.href and hasattr(hub, "session_tabs"):
+                        smap = _load_session_map()
+                        changed = False
+                        for sk, tk in hub.session_tabs.items():
+                            if tk == conn.key and smap.get(sk) != conn.href:
+                                smap[sk] = conn.href
+                                changed = True
+                        if changed:
+                            _save_session_map(smap)
+                    print(f"[hub] url_changed {conn.tab_id} -> {conn.href[:60]}", flush=True)
                     continue
                 if mtype == "pong":
                     continue

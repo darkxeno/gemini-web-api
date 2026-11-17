@@ -567,7 +567,7 @@
     port.onMessage.addListener((m) => {
       if (m.t === "open") {
         s.readyState = 1;
-        ka = setInterval(() => { try { port.postMessage({ t: "ka" }); } catch (e) { finish(); } }, 20000);
+        ka = setInterval(() => { try { port.postMessage({ t: "ka" }); } catch (e) { finish(); } }, 10000);
         if (s.onopen) s.onopen();
       } else if (m.t === "msg") {
         if (s.onmessage) s.onmessage({ data: m.d });
@@ -579,6 +579,30 @@
     port.postMessage({ t: "open", url });
     return s;
   }
+
+  // Track SPA URL changes (/app -> /app/<id>) so the server updates its session map
+  let lastReportedHref = location.href;
+  function reportUrlChange() {
+    if (shuttingDown) return;
+    if (location.href !== lastReportedHref) {
+      lastReportedHref = location.href;
+      sendMsg({ type: "url_changed", tabId: TAB_ID, href: location.href });
+    }
+  }
+  const origPushState = history.pushState;
+  history.pushState = function (...args) {
+    const ret = origPushState.apply(this, args);
+    reportUrlChange();
+    return ret;
+  };
+  const origReplaceState = history.replaceState;
+  history.replaceState = function (...args) {
+    const ret = origReplaceState.apply(this, args);
+    reportUrlChange();
+    return ret;
+  };
+  window.addEventListener("popstate", reportUrlChange);
+  setInterval(reportUrlChange, 1500);
 
   function connect() {
     const wsUrl = `ws://localhost:${PORT}/ws`;
@@ -592,6 +616,7 @@
     ws.onopen = () => {
       LOG("connected");
       backoff = 1000;
+      lastReportedHref = location.href;
       ws.send(JSON.stringify({
         type: "hello", tabId: TAB_ID, authuser: authuserOf(), href: location.href,
         worker: servedJob,
