@@ -6,6 +6,7 @@ Endpoints:
   POST /v1/images/generations      (Gemini/Imagen image generation)
   POST /v1/videos/generations      (Veo3 video generation, async job + poll)
   GET  /v1/videos/generations/{id} (poll a video job)
+  POST /v1/cookies                 (cookie-provider extension; loopback only)
   GET  /health
 """
 
@@ -57,7 +58,7 @@ from .gemini_pool import manager as webapi_manager
 def pick_manager(has_files: bool = False):
     """Choose the chat backend for this request."""
     mode = config.BACKEND
-    if mode == "webapi":
+    if mode in ("webapi", "api"):
         return webapi_manager
     if mode == "chrome":
         return chrome_manager
@@ -70,6 +71,8 @@ def pick_manager(has_files: bool = False):
 
 def active_backend_name() -> str:
     """The chat backend a request would use right now."""
+    if config.BACKEND == "api":
+        return "api"
     return "chrome" if pick_manager() is chrome_manager else "webapi"
 
 
@@ -258,7 +261,65 @@ async def health() -> dict:
         "extension_connected": _chrome_hub.online(),
         "eligible_tabs": len(eligible),
         "free_tabs": len(free),
+        # api mode: seconds since the cookie-provider extension last pushed (None: never)
+        "cookies_pushed_s_ago": _rounded(config.pushed_age()),
     }
+
+
+def _rounded(x: float | None) -> int | None:
+    return None if x is None else round(x)
+
+
+# Hosts a cookie push is accepted from: this machine only. The server listens on
+# 0.0.0.0, and a push replaces the Google session every chat uses.
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+@app.post("/v1/cookies")
+async def push_cookies(request: Request) -> dict:
+    """The cookie-provider extension's push: the browser's current Google cookies.
+
+    Body: {"secure_1psid", "secure_1psidts", "cookies"?: {name: value}} -- the
+    full .google.com jar when given (other accounts, u/N, need SID/SAPISID too).
+    Accepted only from this machine, as JSON, and from the extension or a local
+    tool: a web page in the browser (any http(s) Origin) could otherwise swap in
+    its own Google session. Stored 0600; values are never logged or returned.
+    """
+    host = request.client.host if request.client else ""
+    if host not in _LOOPBACK:
+        raise HTTPException(status_code=403, detail="cookies are accepted from localhost only")
+    origin = request.headers.get("origin", "")
+    if origin and not origin.startswith("chrome-extension://"):
+        raise HTTPException(status_code=403, detail="cookies are not accepted from web pages")
+    if not request.headers.get("content-type", "").startswith("application/json"):
+        raise HTTPException(status_code=415, detail="send JSON")
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid JSON") from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="expected a JSON object")
+    raw = body.get("cookies")
+    jar = {str(k): str(v) for k, v in raw.items() if v} if isinstance(raw, dict) else {}
+    for field, name in (("secure_1psid", "__Secure-1PSID"), ("secure_1psidts", "__Secure-1PSIDTS")):
+        if body.get(field):
+            jar[name] = str(body[field])
+    if not jar.get("__Secure-1PSID"):
+        raise HTTPException(status_code=422, detail="__Secure-1PSID missing")
+    previous = config.pushed_jar()
+    config.store_pushed_jar(jar)
+    changed = jar != previous
+    if config.BACKEND != "api":
+        applied = "stored (used in api mode only)"
+    else:
+        applied = webapi_manager.apply_cookies(jar) if changed else "unchanged"
+    rotation = body.get("rotation")
+    rotated = (f", last RotateCookies HTTP {rotation.get('status')}"
+               if isinstance(rotation, dict) and "status" in rotation else "")
+    print(f"[cookies] push from the extension: {len(jar)} cookies, session "
+          f"{config.account_id(jar['__Secure-1PSID'])}, {applied}{rotated}", flush=True)
+    return {"ok": True, "changed": changed, "applied": applied,
+            "used": config.BACKEND == "api"}
 
 
 @app.get("/v1/status")
@@ -341,7 +402,8 @@ def _chat_session(req: ChatCompletionRequest) -> ChatSession:
     """
     cont = continuation(req.messages)
     return ChatSession(key=session_key(req.messages),
-                       continuation=_with_tools(req, cont) if cont else None)
+                       continuation=_with_tools(req, cont) if cont else None,
+                       messages=tuple(req.messages))
 
 
 async def _run_generation(req: ChatCompletionRequest):

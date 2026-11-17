@@ -38,7 +38,6 @@ WS protocol (server <-> extension):
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import json
 import os
 import re
@@ -47,6 +46,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+from .sessions import CURRENT_CHAT, ChatSession  # noqa: F401  (ChatSession re-exported)
 
 # How long to wait for the tab to finish a reply. Gemini "Pro" mode plus long
 # answers can run well past a minute.
@@ -75,21 +76,6 @@ SESSION_MAP_MAX = 500
 
 # A tab inside a conversation, not on a bare /app.
 IN_CONVERSATION = re.compile(r"/app/[0-9a-f]{6,}")
-
-
-@dataclass(frozen=True)
-class ChatSession:
-    """The conversation a chat request belongs to (see server.py)."""
-
-    key: str
-    # What to send to a tab that already holds the conversation: the messages
-    # since the model's last reply. None on a first turn.
-    continuation: str | None = None
-
-
-CURRENT_CHAT: contextvars.ContextVar[ChatSession | None] = contextvars.ContextVar(
-    "CURRENT_CHAT", default=None
-)
 
 
 def _load_session_map() -> dict[str, str]:

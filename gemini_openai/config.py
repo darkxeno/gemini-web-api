@@ -1,7 +1,8 @@
 """Configuration, cookie extraction, and model mapping.
 
 Single source of truth for:
-  - how we obtain Gemini auth cookies (env var first, then local Chrome)
+  - how we obtain Gemini auth cookies (env var first; in `api` mode the cookies
+    the cookie-provider extension pushes; then local Chrome)
   - how OpenAI-style model names map to gemini_webapi model names
   - server-level settings (optional API key, host/port)
 """
@@ -10,9 +11,12 @@ from __future__ import annotations
 
 import functools
 import glob
+import hashlib
 import json
 import os
 import sys
+import time
+from pathlib import Path
 
 from gemini_webapi.constants import Model
 
@@ -27,6 +31,10 @@ PORT = int(os.getenv("GEMINI_API_PORT", "8100"))
 #            otherwise fall back to the cookie/CDP gemini_webapi library.
 #   "webapi" — always the cookie backend (chat + images + Veo video).
 #   "chrome" — always the extension for chat (errors if no tab is connected).
+#   "api"    — always the cookie backend, with cookies the cookie-provider
+#            extension (extension-cookies/) pushes to POST /v1/cookies, and each
+#            chat session continuing its own Gemini thread (sessions.py). No tab,
+#            no DOM: parallel clients never compete for a browser.
 # Media generation (images/video) always uses the cookie backend regardless, so a
 # single server serves chat-via-extension AND cookie-based media at once.
 BACKEND = os.getenv("GEMINI_BACKEND", "auto").strip().lower()
@@ -165,6 +173,9 @@ def rotate_cookies_ourselves() -> bool:
         AuthError, and the pool re-reads Chrome's current jar and re-inits.
       * explicit GEMINI_1PSID cookies -> there is no other owner, so we must
         refresh them ourselves or the session dies.
+      * cookies pushed by the cookie-provider extension (`api` mode) -> Chrome
+        owns them: the extension calls RotateCookies in Chrome and pushes the
+        result, so we never rotate.
 
     Override with GEMINI_AUTO_REFRESH=1/0 when neither applies (e.g. cookies
     exported from a browser that is no longer running).
@@ -173,6 +184,60 @@ def rotate_cookies_ourselves() -> bool:
     if override is not None:
         return override.strip().lower() not in ("", "0", "false", "no", "off")
     return bool(os.getenv("GEMINI_1PSID"))
+
+
+# --------------------------------------------------------------------------- #
+# Cookies pushed by the cookie-provider extension (`api` mode)
+# --------------------------------------------------------------------------- #
+# Live Google session cookies: the file is this user's only (0600), and neither
+# values nor anything derived from __Secure-1PSID but a short hash is ever printed.
+COOKIE_STORE = Path(os.getenv("GEMINI_COOKIE_STORE", "~/.gemini-web-api/cookies.json")).expanduser()
+_pushed: dict | None = None  # {"jar": {name: value}, "pushed_at": epoch seconds}
+
+
+def _load_pushed() -> dict:
+    global _pushed
+    if _pushed is None:
+        try:
+            data = json.loads(COOKIE_STORE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        jar = data.get("jar") if isinstance(data, dict) else None
+        _pushed = {"jar": {str(k): str(v) for k, v in jar.items()}, "pushed_at": data.get("pushed_at")} \
+            if isinstance(jar, dict) else {"jar": {}, "pushed_at": None}
+    return _pushed
+
+
+def pushed_jar() -> dict[str, str]:
+    """The cookie jar the extension last pushed ({} if none)."""
+    return dict(_load_pushed()["jar"])
+
+
+def pushed_age() -> float | None:
+    """Seconds since the extension last pushed cookies, or None."""
+    at = _load_pushed().get("pushed_at")
+    return time.time() - at if isinstance(at, (int, float)) else None
+
+
+def store_pushed_jar(jar: dict[str, str]) -> None:
+    """Keep the extension's cookies in memory and on disk (0600, atomic)."""
+    global _pushed
+    _pushed = {"jar": dict(jar), "pushed_at": time.time()}
+    COOKIE_STORE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = COOKIE_STORE.with_name(COOKIE_STORE.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(_pushed, f)
+    os.replace(tmp, COOKIE_STORE)
+
+
+def account_id(psid: str | None) -> str:
+    """A short, non-reversible id of a cookie session, safe to log and store."""
+    return hashlib.sha256((psid or "").encode()).hexdigest()[:12] if psid else ""
+
+
+def _use_pushed() -> bool:
+    return BACKEND == "api" and bool(_load_pushed()["jar"].get("__Secure-1PSID"))
 
 
 def get_cookies() -> tuple[str | None, str | None]:
@@ -188,6 +253,10 @@ def get_cookies() -> tuple[str | None, str | None]:
     psidts = os.getenv("GEMINI_1PSIDTS")
     if psid:
         return psid, psidts
+
+    if _use_pushed():
+        jar = pushed_jar()
+        return jar.get("__Secure-1PSID"), jar.get("__Secure-1PSIDTS")
 
     if CDP_URL:
         jar = cookies_via_cdp()
@@ -237,6 +306,8 @@ def get_full_jar() -> dict[str, str]:
     """
     if os.getenv("GEMINI_1PSID"):
         return {}
+    if _use_pushed():
+        return pushed_jar()
     if CDP_URL:
         jar = cookies_via_cdp()
         if jar:

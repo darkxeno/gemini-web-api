@@ -29,6 +29,10 @@ load:
   visible tab — the local launcher runs this).
 - **`chrome`** — always the extension, for chat *and* media generation (errors if
   no tab is connected).
+- **`api`** — always cookies, **pushed by the cookie-provider extension**
+  ([`extension-cookies/`](extension-cookies/)), and every chat session (e.g. one
+  OpenCode terminal) continues **its own Gemini thread**: later turns send only
+  what is new. No tab, no DOM — see [The `api` mode](#the-api-mode-cookie-provider-extension).
 
 **Media bytes come through the tab in every mode.** Outside `chrome` mode, images
 and video are *generated* by the cookie backend, and a connected tab only
@@ -68,6 +72,34 @@ the page CSP doesn't govern, so its socket connects. Architecture and the WS
 protocol are documented at the top of [`gemini_openai/chrome_backend.py`](gemini_openai/chrome_backend.py).
 
 **Chrome-backend limits:** one tab = one worker (chat requests serialized).
+
+### The `api` mode (cookie-provider extension)
+
+Direct HTTP (`StreamGenerate`, like `webapi`) with the browser as the cookie
+source, so nothing scrapes a page or waits on a background tab:
+
+1. Load [`extension-cookies/`](extension-cookies/) unpacked, in the Chrome
+   profile signed in to Google (it can be a dedicated `--user-data-dir`). It has
+   no content scripts. It POSTs the `.google.com` cookie jar to
+   `localhost:8100/v1/cookies` when its worker starts, whenever
+   `__Secure-1PSID`/`__Secure-1PSIDTS` change, and every 8 minutes right after
+   asking Google to rotate `__Secure-1PSIDTS` (`RotateCookies`, through Chrome's
+   own cookie jar). Chrome owns the session: the server never rotates it.
+2. Run the server with `GEMINI_BACKEND=api`. Pushed cookies are stored in
+   `~/.gemini-web-api/cookies.json` (0600) and survive restarts; a push for the
+   same session updates the live client in place, another account's makes a new one.
+3. Check `curl -s localhost:8100/health`: `cookies_pushed_s_ago` should stay
+   under ~8 minutes, and the log shows `[cookies] push from the extension: …,
+   last RotateCookies HTTP 200`.
+
+Each chat session's thread (`[cid, rid, rcid, …]`) is kept in
+`~/.gemini-web-api/sessions.json`. A turn continues it only when the request
+repeats the history the thread last answered plus one reply; a compacted or
+edited history, another account, or a thread Google refuses starts a new one
+with the full prompt. Sessions run in parallel.
+
+`POST /v1/cookies` replaces the Google session every chat uses, so it is accepted
+only from this machine, as JSON, and without a web page's `Origin`.
 
 ## Features
 
@@ -213,6 +245,8 @@ Then: `opencode run -m gemini-web/gemini-3-flash "your prompt"` (verified workin
 | `GEMINI_CHROME_PROFILE` | *(auto)* | pin a Chrome profile dir (e.g. `"Profile 5"`) — lower-level, takes precedence over the account pin |
 | `GEMINI_1PSID` / `GEMINI_1PSIDTS` | *(none)* | supply cookies explicitly (headless/remote); skips reading local Chrome |
 | `GEMINI_AUTO_REFRESH` | *(auto)* | whether **this server** rotates `__Secure-1PSIDTS`. Auto: off for Chrome cookies, on for explicit ones — see below |
+| `GEMINI_COOKIE_STORE` | `~/.gemini-web-api/cookies.json` | `api` mode: where pushed cookies are kept (0600) |
+| `GEMINI_API_SESSIONS` | `~/.gemini-web-api/sessions.json` | `api` mode: each chat session's Gemini thread |
 | `GEMINI_PROXY` | *(none)* | HTTP proxy URL |
 | `GEMINI_MEDIA_DIR` | `media` | where generated videos are saved |
 | `GEMINI_VIDEO_TIMEOUT` | `600` | seconds before a video job fails |

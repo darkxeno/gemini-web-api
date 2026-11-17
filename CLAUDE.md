@@ -144,6 +144,16 @@ Both backends **always load**; `server.py:pick_manager()` routes each chat reque
   `history.pushState`); pins survive restarts via `GEMINI_SESSION_MAP`
   (default `/tmp/gemini-session-map.json`). Test: `tests/session_test.py`.
 
+  **`GEMINI_BACKEND=api`** (branch `feat/cookie-extension-api`): the cookie
+  backend fed by [`extension-cookies/`](extension-cookies/), which pushes the
+  `.google.com` jar to `POST /v1/cookies` and rotates `__Secure-1PSIDTS` in
+  Chrome (so trap 6 holds: the server never rotates). Each chat session keeps its
+  gemini_webapi thread metadata in `sessions.ApiSessionStore` and continues it
+  only when the request extends exactly the history it last answered (digest +
+  count + one assistant reply), on the same cookie session (`config.account_id`,
+  a hash -- trap 5). `/v1/cookies` is loopback-only, JSON-only, no web `Origin`:
+  a push replaces the Google session for every chat. Test: `tests/cookie_api_test.py`.
+
 `config.BACKEND` is a **preference** for chat: `auto` (default — extension when
 a tab is connected, else cookies; vision always cookies), `webapi` (always
 cookies — what `~/bin/gemini-web-api-server` runs), `chrome` (always extension,

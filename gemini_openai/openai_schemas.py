@@ -89,7 +89,7 @@ def _compact_system(txt: str) -> str:
         return (head[:1200] + "\n\n" + txt[idx:]) if len(head) > 1200 else txt
     return txt[:2000]
 
-def _render_turns(messages: list[ChatMessage]) -> tuple[list[tuple[str, str]], list[bytes]]:
+def render_turns(messages: list[ChatMessage]) -> tuple[list[tuple[str, str]], list[bytes]]:
     """Each message as (role, text), tool calls and results rendered inline, plus image bytes."""
     files: list[bytes] = []
     turns: list[tuple[str, str]] = []  # (role, text)
@@ -140,7 +140,7 @@ def session_key(messages: list[ChatMessage]) -> str:
     same on every turn of one conversation. Two conversations that open with the
     same system prompt AND the same first message share a key.
     """
-    turns, _ = _render_turns(messages)
+    turns, _ = render_turns(messages)
     system = "\n\n".join(t for r, t in turns if r == "system" and t.strip())
     first_user = next((t for r, t in turns if r == "user"), "")
     return hashlib.sha256(f"{system[:500]}|{first_user}".encode()).hexdigest()[:16]
@@ -153,7 +153,7 @@ def continuation(messages: list[ChatMessage]) -> str | None:
     the tool results of a parallel tool call, not just the last. None when the
     model hasn't replied yet (the first turn), which needs the full prompt.
     """
-    turns, _ = _render_turns(messages)
+    turns, _ = render_turns(messages)
     last_assistant = max((i for i, (r, _) in enumerate(turns) if r == "assistant"), default=None)
     if last_assistant is None:
         return None
@@ -168,7 +168,7 @@ def flatten_messages(messages: list[ChatMessage]) -> tuple[str, list[bytes]]:
     transcript. A single user turn is sent as-is; multi-turn history is labeled.
     Image parts are extracted as bytes to pass to gemini_webapi's `files=`.
     """
-    turns, files = _render_turns(messages)
+    turns, files = render_turns(messages)
     non_empty = [(r, t) for r, t in turns if t.strip() or r == "user"]
 
     # Fast path: a single user message (optionally with a system message).

@@ -7,6 +7,13 @@ rotation mints a new cookie and invalidates the old one, which logs the browser
 out of that Google account. Chrome owns that session and keeps it fresh itself,
 so a stale token here simply raises AuthError and the retry path below re-reads
 Chrome's current jar. See `config.rotate_cookies_ourselves()`.
+
+In `api` mode the cookies come from the cookie-provider extension
+(`apply_cookies`, fed by POST /v1/cookies), and a chat session continues its own
+Gemini thread: its [cid, rid, rcid, ...] metadata lives in `sessions`, so a
+later turn sends only what is new. A thread that can't be continued (history
+changed, another account, Google refused it) is replaced by a new one with the
+full prompt.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from gemini_webapi import GeminiClient
 from gemini_webapi.exceptions import APIError, AuthError
 
 from . import config
+from .sessions import CURRENT_CHAT, ApiSessionStore, ChatSession
 
 # Errors worth a one-shot re-init + retry: auth expiry, and transient Google
 # API errors (e.g. 1097) that leave a long-running client wedged on a stale
@@ -51,6 +59,12 @@ class GeminiManager:
     def __init__(self) -> None:
         self._client: GeminiClient | None = None
         self._lock = asyncio.Lock()
+        # The cookie session (config.account_id) the client was made with, and
+        # whether pushed cookies of ANOTHER session want a new client.
+        self._account = ""
+        self._stale = False
+        self._closing: set[asyncio.Task] = set()
+        self.sessions = ApiSessionStore()
 
     async def _make_client(self) -> GeminiClient:
         # Route to the configured Google multi-login account (u/N) before init,
@@ -70,6 +84,7 @@ class GeminiManager:
                 "to gemini.google.com in local Chrome."
             )
         proxy = config.os.getenv("GEMINI_PROXY") or None
+        self._account = config.account_id(psid)
         client = GeminiClient(psid, psidts, proxy=proxy)
         # See config.rotate_cookies_ourselves(): rotating a session Chrome also
         # holds logs the browser out, so by default Chrome owns the refresh.
@@ -81,12 +96,35 @@ class GeminiManager:
         return client
 
     async def get(self) -> GeminiClient:
-        if self._client is not None:
+        if self._client is not None and not self._stale:
             return self._client
         async with self._lock:
+            if self._stale and self._client is not None:
+                # Requests still running on the old client finish first.
+                old, self._client = self._client, None
+                task = asyncio.create_task(old.close(delay=300))
+                self._closing.add(task)
+                task.add_done_callback(self._closing.discard)
+            self._stale = False
             if self._client is None:
                 self._client = await self._make_client()
         return self._client
+
+    def apply_cookies(self, jar: dict[str, str]) -> str:
+        """Take cookies the extension pushed. Returns what happened.
+
+        The same session (Chrome rotated __Secure-1PSIDTS): set on the live
+        client in place, nothing re-initializes. Another session (a different
+        account or a new login): the next request makes a new client, whose
+        access token belongs to it.
+        """
+        if self._client is None:
+            return "stored"  # the first request initializes with them
+        if config.account_id(jar.get("__Secure-1PSID")) != self._account:
+            self._stale = True
+            return "reinit"
+        self._client.cookies = dict(jar)
+        return "updated"
 
     async def reset(self) -> None:
         """Drop the client so the next get() re-initializes (e.g. after AuthError)."""
@@ -105,6 +143,9 @@ class GeminiManager:
         session) and throw AuthError or a transient APIError (e.g. 1097). We drop
         the wedged client and retry once against a freshly-initialized one.
         """
+        chat = self._session(kwargs)
+        if chat is not None:
+            return await self._generate_session(chat, *args, **kwargs)
         client = await self.get()
         try:
             return await client.generate_content(*args, **_for_account(client, kwargs))
@@ -119,6 +160,11 @@ class GeminiManager:
         Same one-shot re-init retry as `generate`, but only if the failure happens
         before any chunk was yielded (we can't cleanly restart mid-stream).
         """
+        chat = self._session(kwargs)
+        if chat is not None:
+            async for out in self._stream_session(chat, *args, **kwargs):
+                yield out
+            return
         client = await self.get()
         yielded = False
         try:
@@ -134,6 +180,83 @@ class GeminiManager:
         client = await self.get()
         async for out in client.generate_content_stream(*args, **_for_account(client, kwargs)):
             yield out
+
+    # ---- api mode: a Gemini thread per chat session -------------------------
+    @staticmethod
+    def _session(kwargs: dict) -> ChatSession | None:
+        """The chat session to continue, in `api` mode (files always go fresh)."""
+        if config.BACKEND != "api" or kwargs.get("files"):
+            return None
+        return CURRENT_CHAT.get()
+
+    async def _generate_session(self, chat: ChatSession, prompt, **kwargs):
+        async with self.sessions.lock(chat.key):
+            client = await self.get()
+            thread = self.sessions.thread_for(chat, self._account)
+            if thread is not None:
+                gchat = client.start_chat(metadata=thread)
+                try:
+                    out = await client.generate_content(
+                        chat.continuation, chat=gchat, **_for_account(client, kwargs))
+                    print(f"[api] session {chat.key[:8]}: continued its thread", flush=True)
+                    self.sessions.save(chat, gchat.metadata, self._account)
+                    return out
+                except Exception as e:  # noqa: BLE001
+                    print(f"[api] session {chat.key[:8]}: its thread failed "
+                          f"({type(e).__name__}: {e}); starting a new one", flush=True)
+                    self.sessions.drop(chat.key)
+            for attempt in (1, 2):
+                client = await self.get()
+                gchat = client.start_chat()
+                try:
+                    out = await client.generate_content(
+                        prompt, chat=gchat, **_for_account(client, kwargs))
+                    break
+                except _RETRYABLE:
+                    if attempt == 2:
+                        raise
+                    await self.reset()
+            print(f"[api] session {chat.key[:8]}: new thread", flush=True)
+            self.sessions.save(chat, gchat.metadata, self._account)
+            return out
+
+    async def _stream_session(self, chat: ChatSession, prompt, **kwargs):
+        async with self.sessions.lock(chat.key):
+            client = await self.get()
+            thread = self.sessions.thread_for(chat, self._account)
+            if thread is not None:
+                gchat = client.start_chat(metadata=thread)
+                yielded = False
+                try:
+                    async for out in client.generate_content_stream(
+                            chat.continuation, chat=gchat, **_for_account(client, kwargs)):
+                        yielded = True
+                        yield out
+                    print(f"[api] session {chat.key[:8]}: continued its thread", flush=True)
+                    self.sessions.save(chat, gchat.metadata, self._account)
+                    return
+                except Exception as e:  # noqa: BLE001
+                    self.sessions.drop(chat.key)
+                    if yielded:
+                        raise  # can't restart a reply the client has half-received
+                    print(f"[api] session {chat.key[:8]}: its thread failed "
+                          f"({type(e).__name__}: {e}); starting a new one", flush=True)
+            for attempt in (1, 2):
+                client = await self.get()
+                gchat = client.start_chat()
+                yielded = False
+                try:
+                    async for out in client.generate_content_stream(
+                            prompt, chat=gchat, **_for_account(client, kwargs)):
+                        yielded = True
+                        yield out
+                    break
+                except _RETRYABLE:
+                    if yielded or attempt == 2:
+                        raise
+                    await self.reset()
+            print(f"[api] session {chat.key[:8]}: new thread", flush=True)
+            self.sessions.save(chat, gchat.metadata, self._account)
 
 
 manager = GeminiManager()
