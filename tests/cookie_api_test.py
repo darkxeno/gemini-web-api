@@ -331,3 +331,67 @@ def test_other_modes_never_use_sessions(sessions, monkeypatch):
     run_turns(manager_with(client), TURN1, TURN2)
     assert [s[1] for s in client.sent] == [None, None]  # no chat= at all
     assert not sessions.exists()
+
+
+# --------------------------------------------------------------------------- #
+# No macOS Keychain, no guest sessions
+# --------------------------------------------------------------------------- #
+def test_api_mode_never_reads_chromes_cookie_store_even_before_a_push(monkeypatch):
+    """Chrome's store is decrypted with a Keychain key: a prompt on every read."""
+    monkeypatch.delenv("GEMINI_1PSID", raising=False)
+
+    def keychain(*_a, **_k):
+        raise AssertionError("read Chrome's cookie store")
+
+    monkeypatch.setattr(config, "_cookie_stores", keychain)
+    monkeypatch.setattr(config, "cookies_via_cdp", keychain)
+    assert config.get_cookies() == (None, None)
+    assert config.get_full_jar() == {}
+
+
+MADE_CLIENTS: list = []
+
+
+class FakeGeminiClient:
+    def __init__(self, psid, psidts, proxy=None):
+        self.access_token, self._cookie_source, self.closed = "token", "Base Cookies", False
+        MADE_CLIENTS.append(self)
+
+    async def init(self, **_):
+        pass
+
+    async def close(self, delay=0):
+        self.closed = True
+
+
+def make_client_with(monkeypatch, **state):
+    monkeypatch.delenv("GEMINI_1PSID", raising=False)
+    config.store_pushed_jar({"__Secure-1PSID": PSID})
+    MADE_CLIENTS.clear()
+
+    class Client(FakeGeminiClient):
+        async def init(self, **_):
+            self.__dict__.update(state)
+
+    monkeypatch.setattr(gp, "GeminiClient", Client)
+    return asyncio.run(gp.GeminiManager()._make_client())
+
+
+def test_api_mode_turns_off_the_librarys_own_browser_scan(monkeypatch):
+    import sys
+
+    make_client_with(monkeypatch)
+    scan = sys.modules["gemini_webapi.utils.get_access_token"].load_browser_cookies
+    assert scan(domain_name=".google.com") == {}
+
+
+def test_a_guest_session_is_refused_not_used(monkeypatch):
+    with pytest.raises(gp.AuthError, match="guest"):
+        make_client_with(monkeypatch, access_token=None, _cookie_source="Guest")
+    assert MADE_CLIENTS[-1].closed
+
+
+def test_no_push_yet_names_the_extension(monkeypatch):
+    monkeypatch.delenv("GEMINI_1PSID", raising=False)
+    with pytest.raises(gp.AuthError, match="extension-cookies"):
+        asyncio.run(gp.GeminiManager()._make_client())

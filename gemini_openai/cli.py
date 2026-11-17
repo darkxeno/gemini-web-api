@@ -120,6 +120,15 @@ def cmd_doctor(args) -> None:
     if env_psid:
         print(f"credentials: GEMINI_1PSID env var (len {len(env_psid)})")
         print(f"  GEMINI_1PSIDTS: {'set' if os.getenv('GEMINI_1PSIDTS') else 'NOT set (usually fine)'}")
+    elif os.getenv("GEMINI_BACKEND", "").strip().lower() == "api":
+        from . import config
+        jar, age = config.pushed_jar(), config.pushed_age()
+        print(f"credentials: cookies pushed by the extension ({config.COOKIE_STORE})")
+        print(f"  __Secure-1PSID  : {'found' if jar.get('__Secure-1PSID') else 'NOT PUSHED YET'}")
+        print(f"  cookies         : {len(jar)}, pushed {'never' if age is None else f'{age:.0f}s ago'}")
+        if not jar.get("__Secure-1PSID"):
+            ok = False
+            print("  FIX: load extension-cookies/ in the Chrome profile signed in to Google.")
     else:
         print("credentials: local Chrome cookie store (GEMINI_1PSID not set)")
         try:

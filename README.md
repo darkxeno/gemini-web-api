@@ -88,6 +88,10 @@ source, so nothing scrapes a page or waits on a background tab:
 2. Run the server with `GEMINI_BACKEND=api`. Pushed cookies are stored in
    `~/.gemini-web-api/cookies.json` (0600) and survive restarts; a push for the
    same session updates the live client in place, another account's makes a new one.
+   They are its **only** source: it never reads Chrome's cookie store (no macOS
+   Keychain prompt) -- nor lets `gemini_webapi` scan local browsers itself -- and
+   refuses the logged-out guest session the library falls back to when cookies
+   don't authenticate. Until the first push, chats fail with a hint to load the extension.
 3. Check `curl -s localhost:8100/health`: `cookies_pushed_s_ago` should stay
    under ~8 minutes, and the log shows `[cookies] push from the extension: …,
    last RotateCookies HTTP 200`.
@@ -101,11 +105,15 @@ with the full prompt. Sessions run in parallel.
 `POST /v1/cookies` replaces the Google session every chat uses, so it is accepted
 only from this machine, as JSON, and without a web page's `Origin`.
 
-[`ocweb`](ocweb) launches OpenCode on this setup: it starts the proxy in `api`
+[`ocweb`](ocweb) (run it from the repo, or symlink it onto your PATH) launches
+OpenCode on this setup -- on first run it opens the profile's Chrome to sign in and
+load the extension; it starts the proxy in `api`
 mode if none is running, starts the cookie profile's Chrome in the background (no
 Gemini tab), waits until `/health` shows fresh cookies, and leaves a shared proxy
 running while other OpenCode sessions use it. `GEMINI_BACKEND=chrome ocweb` keeps
-the tab-per-launch behaviour.
+the tab-per-launch behaviour. `ocweb --selftest` runs a live two-turn chat instead
+of OpenCode and checks the second turn continued the first one's Gemini thread
+([`tools/api_selftest.py`](tools/api_selftest.py)).
 
 ## Features
 

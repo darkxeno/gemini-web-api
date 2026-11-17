@@ -6,9 +6,18 @@
 # pushes. Chrome only has to be running with that profile -- no Gemini tab, so
 # any number of ocweb terminals run in parallel, each on its own Gemini thread.
 # GEMINI_BACKEND=chrome ocweb keeps the old behaviour (a fresh Gemini tab per launch).
+#
+# ocweb --selftest: instead of opencode, a live two-turn chat through the proxy
+# that checks the second turn continued the first one's Gemini thread.
 set -euo pipefail
 
 PROJECT_DIR="$(pwd)"
+# The repo this script lives in (also through a symlink, e.g. ~/.local/bin/ocweb),
+# else ~/tools/gemini-web-api (a copy outside the repo).
+SELF="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+if [ -z "${GEMINI_WEB_API_DIR:-}" ] && [ -f "$(dirname "$SELF")/main.py" ]; then
+  GEMINI_WEB_API_DIR="$(dirname "$SELF")"
+fi
 REPO_DIR="${GEMINI_WEB_API_DIR:-$HOME/tools/gemini-web-api}"
 CHROME_PROFILE="$HOME/.chrome-gemini-proxy"
 CHROME_BIN="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
@@ -21,6 +30,18 @@ COOKIES_FRESH_S=900
 export GEMINI_BACKEND="${GEMINI_BACKEND:-api}"
 export PROXY_PORT COOKIES_FRESH_S
 export GEMINI_API_PORT="$PROXY_PORT"
+
+SELFTEST=0
+ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "--selftest" ]; then SELFTEST=1; else ARGS+=("$arg"); fi
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+if [ "$SELFTEST" -eq 0 ] && ! command -v opencode >/dev/null 2>&1; then
+  echo "Error: opencode no está instalado (o no está en el PATH). Prueba: ocweb --selftest"
+  exit 1
+fi
+export GEMINI_PROXY_LOG="$LOG_FILE"
 
 STARTED_PROXY=0
 cleanup() {
@@ -122,11 +143,24 @@ else
     echo "Arrancando Chrome aislado en segundo plano (proveedor de cookies)..."
     start_chrome --no-startup-window
   fi
-  if ! wait_for 20 'h.get("cookies_pushed_s_ago") is not None and h["cookies_pushed_s_ago"] < fresh'; then
-    echo "Aviso: la extensión no ha enviado cookies recientes tras 20s."
-    echo "       Carga $REPO_DIR/extension-cookies en el perfil $CHROME_PROFILE (chrome://extensions,"
-    echo "       Load unpacked) y revisa $LOG_FILE; continuando de todas formas..."
+  FRESH='h.get("cookies_pushed_s_ago") is not None and h["cookies_pushed_s_ago"] < fresh'
+  if ! wait_for 20 "$FRESH"; then
+    # First run (or the extension isn't loaded / signed out): one-time setup in a window.
+    echo "No llegan cookies de la extensión. Abriendo Chrome aislado para configurarlo (una sola vez):"
+    echo "  1. Inicia sesión en Google en esa ventana."
+    echo "  2. En chrome://extensions activa 'Developer mode' -> 'Load unpacked' -> $REPO_DIR/extension-cookies"
+    echo "Esperando hasta 5 minutos a la primera subida de cookies..."
+    start_chrome "https://accounts.google.com/" "chrome://extensions/"
+    if ! wait_for 300 "$FRESH"; then
+      echo "Aviso: sin cookies recientes de la extensión tras 5 minutos (revisa $LOG_FILE); continuando de todas formas..."
+    fi
   fi
+fi
+
+if [ "$SELFTEST" -eq 1 ]; then
+  cd "$REPO_DIR"
+  GEMINI_API_BASE="http://127.0.0.1:$PROXY_PORT" PYTHONPATH=. uv run --active python tools/api_selftest.py
+  exit $?
 fi
 
 cd "$PROJECT_DIR"

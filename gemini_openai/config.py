@@ -237,7 +237,10 @@ def account_id(psid: str | None) -> str:
 
 
 def _use_pushed() -> bool:
-    return BACKEND == "api" and bool(_load_pushed()["jar"].get("__Secure-1PSID"))
+    """api mode reads only what the extension pushed: never Chrome's cookie store,
+    whose decryption key is in the macOS Keychain (a prompt on every read), and
+    never another profile's account. No push yet -> no cookies."""
+    return BACKEND == "api"
 
 
 def get_cookies() -> tuple[str | None, str | None]:

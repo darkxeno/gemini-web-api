@@ -55,6 +55,20 @@ def _for_account(client: GeminiClient, kwargs: dict) -> dict:
         return {**kwargs, "model": None}
 
 
+def _no_library_browser_scan() -> None:
+    """Stop gemini_webapi reading local browsers' cookies on every init.
+
+    Its init collects cookie candidates up front, and that includes every local
+    browser's store through browser_cookie3 -- on macOS a Keychain prompt per
+    start, and possibly another account. api mode's cookies come from the extension.
+    """
+    import sys
+
+    import gemini_webapi.utils.get_access_token  # noqa: F401  (load the module)
+
+    sys.modules["gemini_webapi.utils.get_access_token"].load_browser_cookies = lambda **_: {}
+
+
 class GeminiManager:
     def __init__(self) -> None:
         self._client: GeminiClient | None = None
@@ -76,9 +90,17 @@ class GeminiManager:
 
         apply_authuser(config.AUTHUSER)
         install_full_jar(config.get_full_jar)
+        api_mode = config.BACKEND == "api"
+        if api_mode:
+            _no_library_browser_scan()
 
         psid, psidts = config.get_cookies()
         if not psid:
+            if api_mode:
+                raise AuthError(
+                    "No cookies from the cookie-provider extension yet: load extension-cookies/ "
+                    "in the Chrome profile signed in to Google (ocweb opens it on first run)."
+                )
             raise AuthError(
                 "No Gemini credentials. Set GEMINI_1PSID/GEMINI_1PSIDTS or log in "
                 "to gemini.google.com in local Chrome."
@@ -93,6 +115,15 @@ class GeminiManager:
             auto_refresh=config.rotate_cookies_ourselves(),
             refresh_interval=540,
         )
+        if api_mode and (not getattr(client, "access_token", None)
+                         or getattr(client, "_cookie_source", "") == "Guest"):
+            # When no cookie group authenticates, gemini_webapi falls back to a
+            # logged-out guest session -- which would answer every chat anonymously.
+            await client.close()
+            raise AuthError(
+                "The cookies the extension pushed don't sign in to Google (only a guest "
+                "session came up): sign in again in the extension's Chrome profile."
+            )
         return client
 
     async def get(self) -> GeminiClient:
