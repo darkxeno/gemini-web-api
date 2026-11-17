@@ -11,6 +11,67 @@
 # that checks the second turn continued the first one's Gemini thread.
 set -euo pipefail
 
+usage() {
+  cat <<'HELP'
+ocweb — opencode contra el proxy local gemini-web-api (Gemini web con tu cuenta).
+
+Uso:
+  ocweb [argumentos de opencode...]   abre opencode en la carpeta actual
+  ocweb --selftest                    en vez de opencode: chat de prueba de 2 turnos
+                                      que comprueba que el 2º continúa el hilo del 1º
+  ocweb --help | -h                   esta ayuda (opciones de opencode: opencode --help)
+
+Qué hace: arranca el proxy en el puerto 8100 si no está ya en marcha, prepara el
+navegador según el modo, espera a que esté listo y abre opencode. Varias terminales
+comparten el mismo proxy, que se cierra cuando sale la última. La primera vez instala
+opencode (brew o npm) y crea ~/.config/opencode/opencode.json con el proveedor
+gemini-web; una configuración existente nunca se modifica.
+
+Modos (GEMINI_BACKEND):
+  api      (por defecto) peticiones HTTP directas a Gemini con las cookies que envía la
+           extensión extension-cookies/, cargada sola en un Chromium aislado en segundo
+           plano. Sin pestañas de Gemini; cada sesión de opencode tiene su propio hilo.
+           La primera vez se abre Chromium para iniciar sesión en Google.
+  chrome   la extensión clásica maneja una pestaña de gemini.google.com en Google Chrome
+           (abre una pestaña limpia por lanzamiento; -c / --continue reutiliza la sesión).
+  webapi   HTTP directo con las cookies del Chrome normal (pide acceso al Llavero).
+  auto     chrome si hay una pestaña conectada, si no webapi.
+  Un proxy ya en marcha no cambia de modo: ciérralo (lsof -ti tcp:8100 | xargs kill).
+
+Modelos (modo api; en opencode: -m gemini-web/<modelo>):
+  gemini-4-hydrogen   por defecto, "Ayuda en tu día a día"
+  gemini-flash-lite   el más rápido, "Respuestas rápidas"
+  La lista real de tu cuenta: curl -s localhost:8100/v1/models
+
+Variables de entorno:
+  GEMINI_BACKEND        modo (ver arriba)                        [api]
+  GEMINI_DEFAULT_MODEL  modelo cuando la petición no indica uno  [gemini-4-hydrogen]
+  GEMINI_API_PORT       puerto del proxy                         [8100]
+  CHROME_BIN            navegador  [api: ~/Applications/Chromium.app; chrome: Google Chrome]
+  CHROME_PROFILE        perfil     [api: ~/.chromium-gemini-proxy; chrome: ~/.chrome-gemini-proxy]
+  GEMINI_WEB_API_DIR    repo de gemini-web-api [el de este script, o ~/tools/gemini-web-api]
+  GEMINI_PROXY_LOG      log del proxy                            [/tmp/gemini-web-proxy.log]
+  SELFTEST_MODEL        modelo para --selftest                   [el primero de /v1/models]
+
+Archivos (modo api):
+  ~/.gemini-web-api/cookies.json    cookies enviadas por la extensión (0600)
+  ~/.gemini-web-api/sessions.json   hilo de Gemini de cada sesión de opencode
+
+Ejemplos:
+  ocweb                                  opencode con Hydrogen
+  ocweb -m gemini-web/gemini-flash-lite  opencode con el modelo rápido
+  GEMINI_BACKEND=chrome ocweb            el modo de pestaña clásico
+  ocweb --selftest                       comprobar que todo funciona
+  curl -s localhost:8100/health          estado: modo, cookies, pestañas
+HELP
+}
+# Before anything starts or installs: the help only prints.
+for arg in "$@"; do
+  case "$arg" in
+    --help | -h) usage; exit 0 ;;
+  esac
+done
+
 PROJECT_DIR="$(pwd)"
 # The repo this script lives in (also through a symlink, e.g. ~/.local/bin/ocweb),
 # else ~/tools/gemini-web-api (a copy outside the repo).
