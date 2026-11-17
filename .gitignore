@@ -228,3 +228,6 @@ media/
 scratchpad/
 scratch_*
 .vscode/
+
+# Browser network exports: they hold live session cookies and auth headers
+*.har
