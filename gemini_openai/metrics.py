@@ -58,6 +58,7 @@ class RequestMetrics:
     thread_error: str | None = None
     prompt_chars: int = 0              # the full prompt (a new thread's)
     sent_chars: int = 0                # what was actually sent (continuation or full)
+    tools_prompt: str | None = None    # full | reminder: how a continued turn sent the tools
     lock_wait_s: float | None = None
     client_s: float | None = None
     first_chunk_s: float | None = None

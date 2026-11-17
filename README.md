@@ -127,6 +127,10 @@ generic refusal ("Soy un modelo de lenguaje...") that the client receives as the
 The web app itself sends messages over `processSession` with an anti-bot token.
 `GEMINI_ARGON_THINKING` sets the web's reasoning level: 1 low, 4 medium (default), 2 high.
 
+The opencode config `ocweb` writes sets `small_model` to `gemini-flash-lite` when the
+account has it: opencode's own small tasks (session titles, summaries) go to the fastest
+model, while the model for the actual work is the user's choice (`/models` in opencode).
+
 [`ocweb`](ocweb) (run it from the repo, or symlink it onto your PATH) launches
 OpenCode on this setup -- on first run it opens the profile's Chromium to sign in
 to Google; it starts the proxy in `api` mode if none is running, starts the cookie
@@ -282,7 +286,7 @@ Then: `opencode run -m gemini-web/gemini-3-flash "your prompt"` (verified workin
 | `GEMINI_AUTO_REFRESH` | *(auto)* | whether **this server** rotates `__Secure-1PSIDTS`. Auto: off for Chrome cookies, on for explicit ones — see below |
 | `GEMINI_COOKIE_STORE` | `~/.gemini-web-api/cookies.json` | `api` mode: where pushed cookies are kept (0600) |
 | `GEMINI_REQUEST_LOG` | `~/.gemini-web-api/requests.jsonl` | one JSON line per chat request (0600; `off` disables it): model, thread new/continued, sizes, client init / Gemini / total time, tool calls, the client's tool-run time between turns, refusals, retries, the library's stall recovery, cookies applied mid-request. Never message content |
-| `GEMINI_TOOLS_PROMPT` | `actions` | how tools are offered to Gemini: as actions the user's machine runs, with Gemini's built-in tools off (`legacy`: the old "tools you can call", which made Gemini 4 models try them as built-in tools and refuse) |
+| `GEMINI_TOOLS_PROMPT` | `actions` | how tools are offered to Gemini (in `api` mode a thread gets the full explanation once per tool set, later turns only a short reminder: ~80% less sent per turn): as actions the user's machine runs, with Gemini's built-in tools off (`legacy`: the old "tools you can call", which made Gemini 4 models try them as built-in tools and refuse) |
 | `GEMINI_API_SESSIONS` | `~/.gemini-web-api/sessions.json` | `api` mode: each chat session's Gemini thread |
 | `GEMINI_PROXY` | *(none)* | HTTP proxy URL |
 | `GEMINI_MEDIA_DIR` | `media` | where generated videos are saved |

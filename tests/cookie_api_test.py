@@ -451,3 +451,56 @@ def test_without_a_client_models_fall_back_to_the_static_names(monkeypatch):
     monkeypatch.setattr(server, "webapi_manager", Manager())
     ids = [m["id"] for m in asyncio.run(server.list_models())["data"]]
     assert set(ids) == set(config.list_public_models())
+
+
+# --------------------------------------------------------------------------- #
+# Tools: explained once per thread, reminded on later turns
+# --------------------------------------------------------------------------- #
+def chat_with_tools(pairs, digest):
+    base = chat_for(*pairs)
+    cont = base.continuation
+    return ChatSession(key=base.key, messages=base.messages,
+                       continuation=f"FULL:{cont}" if cont else None,
+                       continuation_brief=f"BRIEF:{cont}" if cont and digest else None,
+                       tools_digest=digest)
+
+
+def run_tool_turns(m, *turns):
+    async def go():
+        for pairs, digest in turns:
+            CURRENT_CHAT.set(chat_with_tools(pairs, digest))
+            await m.generate("FULL", files=None, temporary=True)
+
+    asyncio.run(go())
+
+
+def test_a_thread_given_the_tools_gets_only_a_reminder_after(sessions):
+    client = FakeClient()
+    run_tool_turns(manager_with(client), (TURN1, "tools-A"), (TURN2, "tools-A"), (TURN3, "tools-A"))
+    assert [s[0] for s in client.sent] == ["FULL", "BRIEF:now add a test", "BRIEF:and docs"]
+
+
+def test_another_tool_set_is_explained_again(sessions):
+    client = FakeClient()
+    run_tool_turns(manager_with(client), (TURN1, "tools-A"), (TURN2, "tools-B"), (TURN3, "tools-B"))
+    assert [s[0] for s in client.sent] == ["FULL", "FULL:now add a test", "BRIEF:and docs"]
+
+
+def test_a_turn_without_tools_keeps_what_the_thread_was_given(sessions):
+    client = FakeClient()
+    run_tool_turns(manager_with(client), (TURN1, "tools-A"), (TURN2, None), (TURN3, "tools-A"))
+    assert [s[0] for s in client.sent] == ["FULL", "FULL:now add a test", "BRIEF:and docs"]
+
+
+def test_the_server_builds_the_reminder_only_for_tool_requests():
+    from gemini_openai.openai_schemas import ChatCompletionRequest
+
+    tools_ = [{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}]
+    msgs = [{"role": "user", "content": "go"}, {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "next"}]
+    with_tools = server._chat_session(ChatCompletionRequest(model="m", messages=msgs, tools=tools_))
+    assert with_tools.continuation_brief.startswith("# ACTIONS (reminder)")
+    assert with_tools.continuation_brief.endswith("next") and "bash" in with_tools.continuation_brief
+    assert with_tools.tools_digest and len(with_tools.continuation) > len(with_tools.continuation_brief)
+    plain = server._chat_session(ChatCompletionRequest(model="m", messages=msgs))
+    assert plain.continuation_brief is None and plain.tools_digest is None

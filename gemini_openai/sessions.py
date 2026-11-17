@@ -38,6 +38,11 @@ class ChatSession:
     continuation: str | None = None
     # The request's messages, to check a stored thread is still this history.
     messages: tuple[ChatMessage, ...] = ()
+    # The same continuation with the tools only REMINDED (tools.build_tools_reminder),
+    # for a thread already given the full explanation of the same tool set
+    # (tools_digest). None without tools.
+    continuation_brief: str | None = None
+    tools_digest: str | None = None
 
 
 CURRENT_CHAT: contextvars.ContextVar[ChatSession | None] = contextvars.ContextVar(
@@ -126,14 +131,22 @@ class ApiSessionStore:
         metadata = entry.get("metadata")
         return list(metadata) if isinstance(metadata, list) else None
 
+    def tools_explained(self, chat: ChatSession) -> bool:
+        """Whether the session's thread was already given the full explanation of the
+        request's tool set, so a reminder is enough."""
+        entry = self._load().get(chat.key) or {}
+        return bool(chat.tools_digest) and entry.get("tools_digest") == chat.tools_digest
+
     def save(self, chat: ChatSession, metadata: list, account: str) -> None:
         data = self._load()
-        data.pop(chat.key, None)
+        previous = data.pop(chat.key, None) or {}
         data[chat.key] = {  # newest last
             "metadata": list(metadata),
             "n": len(chat.messages),
             "digest": history_digest(chat.messages),
             "account": account,
+            # Every turn sent with tools explained (full) or reminded (same set) them.
+            "tools_digest": chat.tools_digest or previous.get("tools_digest"),
             "updated": time.time(),
         }
         while len(data) > SESSION_STORE_MAX:

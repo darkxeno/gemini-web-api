@@ -57,14 +57,7 @@ def build_tools_prompt(tools: list[dict[str, Any]], tool_choice: Any = None) -> 
         lines.append(f"- {name} ({desc}): {json.dumps(compact_params, separators=(',', ':'))}")
     tool_list = "\n".join(lines)
 
-    # tool_choice handling: "required"/{"type":"function",...} forces a call.
-    forced = ""
-    if tool_choice == "required":
-        forced = "\nYou MUST call at least one tool in this turn."
-    elif isinstance(tool_choice, dict):
-        fname = (tool_choice.get("function") or {}).get("name")
-        if fname:
-            forced = f"\nYou MUST call the `{fname}` tool in this turn."
+    forced = _forced(tool_choice)
 
     if os.getenv("GEMINI_TOOLS_PROMPT", "actions") != "legacy":
         # Offered as "tools you can call", Gemini 4 models may try them as their own
@@ -105,6 +98,57 @@ Rules:
 
 Available tools:
 {tool_list}{forced}
+"""
+
+
+def _forced(tool_choice: Any) -> str:
+    """tool_choice "required" / {"type":"function",...} forces a call this turn."""
+    if tool_choice == "required":
+        return "\nYou MUST call at least one tool in this turn."
+    if isinstance(tool_choice, dict):
+        fname = (tool_choice.get("function") or {}).get("name")
+        if fname:
+            return f"\nYou MUST call the `{fname}` tool in this turn."
+    return ""
+
+
+def _tool_names(tools: list[dict[str, Any]]) -> list[str]:
+    names = []
+    for t in tools:
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        if fn.get("name"):
+            names.append(fn["name"])
+    return names
+
+
+def tools_digest(tools: list[dict[str, Any]] | None) -> str | None:
+    """A fingerprint of the tool set (names and schemas): a thread that was given the
+    full explanation of THIS set needs only a reminder; another set needs it again."""
+    if not tools:
+        return None
+    import hashlib
+
+    canon = json.dumps(sorted(tools, key=lambda t: json.dumps(t, sort_keys=True)), sort_keys=True)
+    return hashlib.sha256(canon.encode()).hexdigest()[:16]
+
+
+def build_tools_reminder(tools: list[dict[str, Any]], tool_choice: Any = None) -> str:
+    """The short form for a turn that continues a thread already given build_tools_prompt
+    for the same tools: the format and rules were explained at its start."""
+    names = ", ".join(_tool_names(tools))
+    if os.getenv("GEMINI_TOOLS_PROMPT", "actions") != "legacy":
+        return f"""# ACTIONS (reminder)
+
+You can still request actions from the user's machine exactly as explained at the
+start of this conversation: a SINGLE fenced ```json block with {{"tool_calls": [...]}}
+and nothing else, code in separate blocks with the same placeholders. Still no
+built-in tools of your own. Available actions: {names}.{_forced(tool_choice)}
+"""
+    return f"""# TOOLS (reminder)
+
+You can still call tools exactly as explained at the start of this conversation: a
+SINGLE fenced ```json block with {{"tool_calls": [...]}} and nothing else, code in
+separate blocks with the same placeholders. Available tools: {names}.{_forced(tool_choice)}
 """
 
 

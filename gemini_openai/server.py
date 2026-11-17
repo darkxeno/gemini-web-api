@@ -431,9 +431,16 @@ def _chat_session(req: ChatCompletionRequest) -> ChatSession:
     Its continuation keeps the tool schemas in front, as every full prompt has them.
     """
     cont = continuation(req.messages)
-    return ChatSession(key=session_key(req.messages),
-                       continuation=_with_tools(req, cont) if cont else None,
-                       messages=tuple(req.messages))
+    tools_on = bool(req.tools) and req.tool_choice != "none"
+    return ChatSession(
+        key=session_key(req.messages),
+        continuation=_with_tools(req, cont) if cont else None,
+        messages=tuple(req.messages),
+        # api mode: a thread that already has these tools gets only a reminder of them.
+        continuation_brief=(tools_mod.build_tools_reminder(req.tools, req.tool_choice) + "\n\n" + cont)
+        if cont and tools_on else None,
+        tools_digest=tools_mod.tools_digest(req.tools) if tools_on else None,
+    )
 
 
 async def _run_generation(req: ChatCompletionRequest):

@@ -45,7 +45,8 @@ Modelos (modo api; en opencode: -m gemini-web/<modelo>):
   gemini-argon        4 Argon, "Código y análisis": EXPERIMENTAL, a menudo no responde o
                       devuelve un rechazo genérico ("Soy un modelo de lenguaje...")
   La lista real de tu cuenta: curl -s localhost:8100/v1/models. La configuración de
-  opencode se crea con esa lista la primera vez; para regenerarla, bórrala.
+  opencode se crea con esa lista la primera vez (con small_model = gemini-flash-lite para
+  los títulos y resúmenes que genera opencode); para regenerarla, bórrala.
 
 Variables de entorno:
   GEMINI_BACKEND        modo (ver arriba)                        [api]
@@ -175,6 +176,8 @@ if not models:
 config = {
     "$schema": "https://opencode.ai/config.json",
     "model": "gemini-web/" + next(iter(models)),
+    # opencode's own small tasks (session titles, summaries) on the fastest model.
+    **({"small_model": "gemini-web/gemini-flash-lite"} if "gemini-flash-lite" in models else {}),
     "provider": {
         "gemini-web": {
             "npm": "@ai-sdk/openai-compatible",
@@ -187,7 +190,8 @@ config = {
 with open(os.environ["OUT"], "w", encoding="utf-8") as f:
     json.dump(config, f, ensure_ascii=False, indent=2)
     f.write("\n")
-print("  modelos:", ", ".join(models), "| por defecto:", next(iter(models)))
+print("  modelos:", ", ".join(models), "| por defecto:", next(iter(models)),
+      "| títulos y resúmenes:", config.get("small_model", "el de por defecto"))
 PY
 }
 

@@ -233,6 +233,16 @@ class GeminiManager:
             return None
         return CURRENT_CHAT.get()
 
+    def _continuation(self, chat: ChatSession) -> str:
+        """What a continued turn sends: the tools reminded when the thread was already
+        given the full explanation of this tool set, else explained again."""
+        if chat.continuation_brief and self.sessions.tools_explained(chat):
+            sent, how = chat.continuation_brief, "reminder"
+        else:
+            sent, how = chat.continuation, ("full" if chat.tools_digest else None)
+        metrics.note(thread="continued", sent_chars=len(sent or ""), tools_prompt=how)
+        return sent
+
     async def _timed_get(self) -> GeminiClient:
         """get(), with how long it took on the request's metrics (a first init is seconds)."""
         t0 = time.monotonic()
@@ -262,13 +272,13 @@ class GeminiManager:
             thread = self.sessions.thread_for(chat, self._account)
             if thread is not None:
                 gchat = client.start_chat(metadata=thread)
-                metrics.note(thread="continued", sent_chars=len(chat.continuation or ""))
+                sent = self._continuation(chat)
                 try:
                     t0 = time.monotonic()
                     out = await client.generate_content(
-                        chat.continuation, chat=gchat, **_for_account(client, kwargs))
+                        sent, chat=gchat, **_for_account(client, kwargs))
                     metrics.note(gemini_s=round(time.monotonic() - t0, 2))
-                    self._log_turn(chat, "continued its thread", kwargs, started, chat.continuation)
+                    self._log_turn(chat, "continued its thread", kwargs, started, sent)
                     self.sessions.save(chat, gchat.metadata, self._account)
                     return out
                 except Exception as e:  # noqa: BLE001
@@ -279,7 +289,7 @@ class GeminiManager:
             m = metrics.current()
             if m is not None and m.thread != "continue_failed":
                 m.thread = "new"
-            metrics.note(sent_chars=len(prompt or ""))
+            metrics.note(sent_chars=len(prompt or ""), tools_prompt="full" if chat.tools_digest else None)
             for attempt in (1, 2):
                 client = await self.get()
                 gchat = client.start_chat()
@@ -306,18 +316,18 @@ class GeminiManager:
             thread = self.sessions.thread_for(chat, self._account)
             if thread is not None:
                 gchat = client.start_chat(metadata=thread)
-                metrics.note(thread="continued", sent_chars=len(chat.continuation or ""))
+                sent = self._continuation(chat)
                 yielded = False
                 try:
                     t0 = time.monotonic()
                     async for out in client.generate_content_stream(
-                            chat.continuation, chat=gchat, **_for_account(client, kwargs)):
+                            sent, chat=gchat, **_for_account(client, kwargs)):
                         if not yielded:
                             metrics.note(first_chunk_s=round(time.monotonic() - t0, 2))
                         yielded = True
                         yield out
                     metrics.note(gemini_s=round(time.monotonic() - t0, 2))
-                    self._log_turn(chat, "continued its thread", kwargs, started, chat.continuation)
+                    self._log_turn(chat, "continued its thread", kwargs, started, sent)
                     self.sessions.save(chat, gchat.metadata, self._account)
                     return
                 except Exception as e:  # noqa: BLE001
@@ -330,7 +340,7 @@ class GeminiManager:
             m = metrics.current()
             if m is not None and m.thread != "continue_failed":
                 m.thread = "new"
-            metrics.note(sent_chars=len(prompt or ""))
+            metrics.note(sent_chars=len(prompt or ""), tools_prompt="full" if chat.tools_digest else None)
             for attempt in (1, 2):
                 client = await self.get()
                 gchat = client.start_chat()
