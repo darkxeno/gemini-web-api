@@ -21,7 +21,7 @@ import os
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from . import config, tools as tools_mod, video as video_mod, web_models
+from . import config, metrics, tools as tools_mod, video as video_mod, web_models
 from .openai_schemas import (
     ChatCompletionRequest,
     chunk,
@@ -53,6 +53,9 @@ from .chrome_backend import (
     register_ws,
 )
 from .gemini_pool import manager as webapi_manager
+
+
+metrics.install_library_sink()
 
 
 def pick_manager(has_files: bool = False):
@@ -338,6 +341,8 @@ async def push_cookies(request: Request) -> dict:
         applied = "stored (used in api mode only)"
     else:
         applied = webapi_manager.apply_cookies(jar) if changed else "unchanged"
+        if applied in ("updated", "reinit"):
+            metrics.cookies_applied()
     rotation = body.get("rotation")
     rotated = (f", last RotateCookies HTTP {rotation.get('status')}"
                if isinstance(rotation, dict) and "status" in rotation else "")
@@ -444,7 +449,9 @@ async def _run_generation(req: ChatCompletionRequest):
         raise HTTPException(status_code=400, detail="empty prompt")
 
     prompt = _with_tools(req, prompt)
-    CURRENT_CHAT.set(_chat_session(req))
+    chat = _chat_session(req)
+    CURRENT_CHAT.set(chat)
+    _note_request(req, model, prompt, chat)
 
     output = await pick_manager(has_files=bool(files)).generate(
         prompt,
@@ -453,15 +460,33 @@ async def _run_generation(req: ChatCompletionRequest):
         temporary=True,  # keep the user's Gemini history clean
     )
     text = render_output(output)
+    metrics.note(response_chars=len(text or ""), refusal=metrics.classify_refusal(text))
 
     if req.tools and req.tool_choice != "none":
+        t0 = time.monotonic()
         parsed = tools_mod.parse_tool_calls(text)
+        metrics.note(parse_s=round(time.monotonic() - t0, 3))
         if parsed:
             tool_calls = tools_mod.to_openai_tool_calls(parsed)
+            metrics.note(tool_parse="parsed", finish_reason="tool_calls",
+                         tool_calls=[tc["function"]["name"] for tc in tool_calls])
             # Any prose outside the tool json is dropped (don't leak it as content
             # to agentic clients — the dominant failure mode).
             return None, tool_calls, prompt
+        metrics.note(tool_parse="no_tool_call")
+    metrics.note(finish_reason="stop")
     return text, None, prompt
+
+
+def _note_request(req: ChatCompletionRequest, model, prompt: str, chat) -> None:
+    """What the request asked for, on its metrics (sizes and names only)."""
+    metrics.note(model=getattr(model, "model_name", None) or str(model), messages=len(req.messages),
+                 tools=len(req.tools or []), prompt_chars=len(prompt or ""),
+                 tool_choice=req.tool_choice if isinstance(req.tool_choice, str) else
+                 ("named" if req.tool_choice else None))
+    m = metrics.current()
+    if m is not None:
+        metrics.session_turn(m, chat.key, req.messages[-1].role if req.messages else None)
 
 
 @app.post("/v1/chat/completions")
@@ -469,12 +494,17 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
     model_name = req.model or "gemini-3-flash"
 
     if not req.stream:
+        m = metrics.start(config.BACKEND, False, req.model)
         try:
             content, tool_calls, prompt = await _run_generation(req)
-        except HTTPException:
+        except HTTPException as e:
+            m.error = f"HTTP {e.status_code}: {str(e.detail)[:200]}"
             raise
         except Exception as e:  # noqa: BLE001 -- surface upstream/backend errors informatively
+            m.error = f"{type(e).__name__}: {str(e)[:200]}"
             raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            metrics.finish(m)
         return JSONResponse(
             completion_response(
                 model_name, content, _est_tokens(prompt),
@@ -483,6 +513,14 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
         )
 
     async def event_stream():
+        m = metrics.start(config.BACKEND, True, req.model)
+        try:
+            async for piece in _event_stream(m):
+                yield piece
+        finally:
+            metrics.finish(m)
+
+    async def _event_stream(m):
         rid = _rid()
         created = int(time.time())
         yield _sse(chunk(model_name, rid, created, {"role": "assistant"}))
@@ -493,10 +531,12 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
             try:
                 content, tool_calls, _ = await _run_generation(req)
             except HTTPException as e:
+                m.error = f"HTTP {e.status_code}: {str(e.detail)[:200]}"
                 yield _sse(chunk(model_name, rid, created, {"content": f"[error: {e.detail}]"}, "stop"))
                 yield "data: [DONE]\n\n"
                 return
             except Exception as e:  # noqa: BLE001
+                m.error = f"{type(e).__name__}: {str(e)[:200]}"
                 yield _sse(chunk(model_name, rid, created, {"content": f"[error: {e}]"}, "stop"))
                 yield "data: [DONE]\n\n"
                 return
@@ -522,7 +562,10 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
             return
 
         final_output = None
-        CURRENT_CHAT.set(_chat_session(req))
+        chat = _chat_session(req)
+        CURRENT_CHAT.set(chat)
+        _note_request(req, model, prompt, chat)
+        streamed = ""
         try:
             async for out in pick_manager(has_files=bool(files)).generate_stream(
                 prompt, files=files or None, model=model, temporary=True
@@ -530,15 +573,20 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
                 final_output = out
                 delta = out.text_delta or ""
                 if delta:
+                    streamed += delta
                     yield _sse(chunk(model_name, rid, created, {"content": delta}))
         except HTTPException as e:
+            m.error = f"HTTP {e.status_code}: {str(e.detail)[:200]}"
             yield _sse(chunk(model_name, rid, created, {"content": f"[error: {e.detail}]"}, "stop"))
             yield "data: [DONE]\n\n"
             return
         except Exception as e:  # noqa: BLE001
+            m.error = f"{type(e).__name__}: {str(e)[:200]}"
             yield _sse(chunk(model_name, rid, created, {"content": f"[error: {e}]"}, "stop"))
             yield "data: [DONE]\n\n"
             return
+        metrics.note(response_chars=len(streamed), refusal=metrics.classify_refusal(streamed),
+                     finish_reason="stop", tool_parse="not_requested")
 
         # Any generated media (images/videos) isn't part of text_delta — append it.
         media = _media_markdown(final_output) if final_output else ""

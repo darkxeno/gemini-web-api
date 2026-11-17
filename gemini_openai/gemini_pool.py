@@ -19,11 +19,12 @@ full prompt.
 from __future__ import annotations
 
 import asyncio
+import time
 
 from gemini_webapi import GeminiClient
 from gemini_webapi.exceptions import APIError, AuthError
 
-from . import config, web_models
+from . import config, metrics, web_models
 from .sessions import CURRENT_CHAT, ApiSessionStore, ChatSession
 
 # Errors worth a one-shot re-init + retry: auth expiry, and transient Google
@@ -185,13 +186,17 @@ class GeminiManager:
         chat = self._session(kwargs)
         if chat is not None:
             return await self._generate_session(chat, *args, **kwargs)
-        client = await self.get()
+        client = await self._timed_get()
+        t0 = time.monotonic()
         try:
-            return await client.generate_content(*args, **_for_account(client, kwargs))
+            out = await client.generate_content(*args, **_for_account(client, kwargs))
         except _RETRYABLE:
+            self._count_retry()
             await self.reset()
             client = await self.get()
-            return await client.generate_content(*args, **_for_account(client, kwargs))
+            out = await client.generate_content(*args, **_for_account(client, kwargs))
+        metrics.note(gemini_s=round(time.monotonic() - t0, 2))
+        return out
 
     async def generate_stream(self, *args, **kwargs):
         """True token streaming: yields ModelOutput chunks (with `text_delta`).
@@ -228,73 +233,124 @@ class GeminiManager:
             return None
         return CURRENT_CHAT.get()
 
+    async def _timed_get(self) -> GeminiClient:
+        """get(), with how long it took on the request's metrics (a first init is seconds)."""
+        t0 = time.monotonic()
+        client = await self.get()
+        metrics.note(client_s=round(time.monotonic() - t0, 3))
+        return client
+
+    @staticmethod
+    def _count_retry() -> None:
+        m = metrics.current()
+        if m is not None:
+            m.retries += 1
+
+    @staticmethod
+    def _log_turn(chat: ChatSession, what: str, kwargs: dict, started: float, sent: str) -> None:
+        """One line per answered turn: which thread, model, how long Gemini took, how much was sent."""
+        model = kwargs.get("model")
+        name = model.get("model_name") if isinstance(model, dict) else (model or "default")
+        print(f"[api] session {chat.key[:8]}: {what} ({name}, {time.monotonic() - started:.1f}s, "
+              f"sent {len(sent or '')} chars)", flush=True)
+
     async def _generate_session(self, chat: ChatSession, prompt, **kwargs):
+        started = time.monotonic()
         async with self.sessions.lock(chat.key):
-            client = await self.get()
+            metrics.note(lock_wait_s=round(time.monotonic() - started, 3))
+            client = await self._timed_get()
             thread = self.sessions.thread_for(chat, self._account)
             if thread is not None:
                 gchat = client.start_chat(metadata=thread)
+                metrics.note(thread="continued", sent_chars=len(chat.continuation or ""))
                 try:
+                    t0 = time.monotonic()
                     out = await client.generate_content(
                         chat.continuation, chat=gchat, **_for_account(client, kwargs))
-                    print(f"[api] session {chat.key[:8]}: continued its thread", flush=True)
+                    metrics.note(gemini_s=round(time.monotonic() - t0, 2))
+                    self._log_turn(chat, "continued its thread", kwargs, started, chat.continuation)
                     self.sessions.save(chat, gchat.metadata, self._account)
                     return out
                 except Exception as e:  # noqa: BLE001
+                    metrics.note(thread="continue_failed", thread_error=f"{type(e).__name__}: {str(e)[:160]}")
                     print(f"[api] session {chat.key[:8]}: its thread failed "
                           f"({type(e).__name__}: {e}); starting a new one", flush=True)
                     self.sessions.drop(chat.key)
+            m = metrics.current()
+            if m is not None and m.thread != "continue_failed":
+                m.thread = "new"
+            metrics.note(sent_chars=len(prompt or ""))
             for attempt in (1, 2):
                 client = await self.get()
                 gchat = client.start_chat()
                 try:
+                    t0 = time.monotonic()
                     out = await client.generate_content(
                         prompt, chat=gchat, **_for_account(client, kwargs))
+                    metrics.note(gemini_s=round(time.monotonic() - t0, 2))
                     break
                 except _RETRYABLE:
                     if attempt == 2:
                         raise
+                    self._count_retry()
                     await self.reset()
-            print(f"[api] session {chat.key[:8]}: new thread", flush=True)
+            self._log_turn(chat, "new thread", kwargs, started, prompt)
             self.sessions.save(chat, gchat.metadata, self._account)
             return out
 
     async def _stream_session(self, chat: ChatSession, prompt, **kwargs):
+        started = time.monotonic()
         async with self.sessions.lock(chat.key):
-            client = await self.get()
+            metrics.note(lock_wait_s=round(time.monotonic() - started, 3))
+            client = await self._timed_get()
             thread = self.sessions.thread_for(chat, self._account)
             if thread is not None:
                 gchat = client.start_chat(metadata=thread)
+                metrics.note(thread="continued", sent_chars=len(chat.continuation or ""))
                 yielded = False
                 try:
+                    t0 = time.monotonic()
                     async for out in client.generate_content_stream(
                             chat.continuation, chat=gchat, **_for_account(client, kwargs)):
+                        if not yielded:
+                            metrics.note(first_chunk_s=round(time.monotonic() - t0, 2))
                         yielded = True
                         yield out
-                    print(f"[api] session {chat.key[:8]}: continued its thread", flush=True)
+                    metrics.note(gemini_s=round(time.monotonic() - t0, 2))
+                    self._log_turn(chat, "continued its thread", kwargs, started, chat.continuation)
                     self.sessions.save(chat, gchat.metadata, self._account)
                     return
                 except Exception as e:  # noqa: BLE001
                     self.sessions.drop(chat.key)
+                    metrics.note(thread="continue_failed", thread_error=f"{type(e).__name__}: {str(e)[:160]}")
                     if yielded:
                         raise  # can't restart a reply the client has half-received
                     print(f"[api] session {chat.key[:8]}: its thread failed "
                           f"({type(e).__name__}: {e}); starting a new one", flush=True)
+            m = metrics.current()
+            if m is not None and m.thread != "continue_failed":
+                m.thread = "new"
+            metrics.note(sent_chars=len(prompt or ""))
             for attempt in (1, 2):
                 client = await self.get()
                 gchat = client.start_chat()
                 yielded = False
                 try:
+                    t0 = time.monotonic()
                     async for out in client.generate_content_stream(
                             prompt, chat=gchat, **_for_account(client, kwargs)):
+                        if not yielded:
+                            metrics.note(first_chunk_s=round(time.monotonic() - t0, 2))
                         yielded = True
                         yield out
+                    metrics.note(gemini_s=round(time.monotonic() - t0, 2))
                     break
                 except _RETRYABLE:
                     if yielded or attempt == 2:
                         raise
+                    self._count_retry()
                     await self.reset()
-            print(f"[api] session {chat.key[:8]}: new thread", flush=True)
+            self._log_turn(chat, "new thread", kwargs, started, prompt)
             self.sessions.save(chat, gchat.metadata, self._account)
 
 

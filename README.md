@@ -281,6 +281,8 @@ Then: `opencode run -m gemini-web/gemini-3-flash "your prompt"` (verified workin
 | `GEMINI_1PSID` / `GEMINI_1PSIDTS` | *(none)* | supply cookies explicitly (headless/remote); skips reading local Chrome |
 | `GEMINI_AUTO_REFRESH` | *(auto)* | whether **this server** rotates `__Secure-1PSIDTS`. Auto: off for Chrome cookies, on for explicit ones — see below |
 | `GEMINI_COOKIE_STORE` | `~/.gemini-web-api/cookies.json` | `api` mode: where pushed cookies are kept (0600) |
+| `GEMINI_REQUEST_LOG` | `~/.gemini-web-api/requests.jsonl` | one JSON line per chat request (0600; `off` disables it): model, thread new/continued, sizes, client init / Gemini / total time, tool calls, the client's tool-run time between turns, refusals, retries, the library's stall recovery, cookies applied mid-request. Never message content |
+| `GEMINI_TOOLS_PROMPT` | `actions` | how tools are offered to Gemini: as actions the user's machine runs, with Gemini's built-in tools off (`legacy`: the old "tools you can call", which made Gemini 4 models try them as built-in tools and refuse) |
 | `GEMINI_API_SESSIONS` | `~/.gemini-web-api/sessions.json` | `api` mode: each chat session's Gemini thread |
 | `GEMINI_PROXY` | *(none)* | HTTP proxy URL |
 | `GEMINI_MEDIA_DIR` | `media` | where generated videos are saved |

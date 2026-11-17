@@ -56,10 +56,14 @@ Variables de entorno:
   GEMINI_WEB_API_DIR    repo de gemini-web-api [el de este script, o ~/tools/gemini-web-api]
   GEMINI_PROXY_LOG      log del proxy                            [/tmp/gemini-web-proxy.log]
   SELFTEST_MODEL        modelo para --selftest                   [el primero de /v1/models]
+  GEMINI_REQUEST_LOG    métricas por petición; "off" las apaga  [~/.gemini-web-api/requests.jsonl]
+  GEMINI_TOOLS_PROMPT   cómo se ofrecen las herramientas         [actions; legacy = las antiguas]
 
 Archivos (modo api):
   ~/.gemini-web-api/cookies.json    cookies enviadas por la extensión (0600)
   ~/.gemini-web-api/sessions.json   hilo de Gemini de cada sesión de opencode
+  ~/.gemini-web-api/requests.jsonl  métricas por petición (tiempos, herramientas, rechazos;
+                                    nunca el contenido). Resumen: grep "^\[req\]" del log
 
 Ejemplos:
   ocweb                                  opencode con Hydrogen

@@ -21,6 +21,7 @@ Key reliability techniques (from the research):
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import uuid
@@ -65,12 +66,28 @@ def build_tools_prompt(tools: list[dict[str, Any]], tool_choice: Any = None) -> 
         if fname:
             forced = f"\nYou MUST call the `{fname}` tool in this turn."
 
-    return f"""# TOOLS
+    if os.getenv("GEMINI_TOOLS_PROMPT", "actions") != "legacy":
+        # Offered as "tools you can call", Gemini 4 models may try them as their own
+        # built-in tools (an unknown one costs a call: "You have exceeded the maximum
+        # number of tool and search calls (0 remaining)"), and end with a generic
+        # refusal. Measured 2026-11-17 on gemini-4-hydrogen, opencode-style tools, 4 runs
+        # each: "tools" 3/4 tool calls + 1 refusal, median 18.9s; "actions" 4/4, 0
+        # refusals, median 15.1s. GEMINI_TOOLS_PROMPT=legacy restores the old wording.
+        intro = """# ACTIONS
+
+You have no tools of your own in this conversation: do NOT use Google Search, code
+execution or any other built-in tool, and do not try to run anything yourself. The
+user's machine runs actions for you. To request one or more, reply with a SINGLE
+fenced ```json block containing ONLY this object and nothing else before or after it:
+"""
+    else:
+        intro = """# TOOLS
 
 You can call the following tools. When you decide to use one or more tools,
 reply with a SINGLE fenced ```json block containing ONLY this object and nothing
 else before or after it:
-
+"""
+    return intro + f"""
 ```json
 {{"tool_calls": [{{"name": "<tool_name>", "arguments": {{ ... }}}}]}}
 ```
