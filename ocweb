@@ -1,50 +1,70 @@
 #!/usr/bin/env bash
+# opencode against the local gemini-web-api proxy.
+#
+# Default GEMINI_BACKEND=api: the proxy talks to Gemini over HTTP with the cookies
+# the cookie-provider extension (extension-cookies/, loaded once in $CHROME_PROFILE)
+# pushes. Chrome only has to be running with that profile -- no Gemini tab, so
+# any number of ocweb terminals run in parallel, each on its own Gemini thread.
+# GEMINI_BACKEND=chrome ocweb keeps the old behaviour (a fresh Gemini tab per launch).
 set -euo pipefail
 
 PROJECT_DIR="$(pwd)"
-REPO_DIR="$HOME/tools/gemini-web-api"
-EXT_DIR="$REPO_DIR/extension"
+REPO_DIR="${GEMINI_WEB_API_DIR:-$HOME/tools/gemini-web-api}"
 CHROME_PROFILE="$HOME/.chrome-gemini-proxy"
-PROXY_PORT="8100"
-LOG_FILE="/tmp/gemini-web-proxy.log"
+CHROME_BIN="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+# The extension pushes to 8100 unless told otherwise (chrome.storage.local {port}).
+PROXY_PORT="${GEMINI_API_PORT:-8100}"
+LOG_FILE="${GEMINI_PROXY_LOG:-/tmp/gemini-web-proxy.log}"
+# The extension pushes on start and every 8 minutes: older than this means it isn't running.
+COOKIES_FRESH_S=900
 
-export GEMINI_BACKEND="chrome"
+export GEMINI_BACKEND="${GEMINI_BACKEND:-api}"
+export PROXY_PORT COOKIES_FRESH_S
+export GEMINI_API_PORT="$PROXY_PORT"
 
 STARTED_PROXY=0
 cleanup() {
-  if [ "$STARTED_PROXY" -eq 1 ] && [ -n "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+  [ "$STARTED_PROXY" -eq 1 ] && [ -n "${PROXY_PID:-}" ] || return 0
+  kill -0 "$PROXY_PID" 2>/dev/null || return 0
+  # Other ocweb terminals share this proxy: leave it to the last one.
+  if pgrep -x opencode >/dev/null 2>&1; then
     echo ""
-    echo "Cerrando proxy local de Gemini Web (PID $PROXY_PID)..."
-    kill "$PROXY_PID" 2>/dev/null || true
+    echo "Proxy de Gemini Web (PID $PROXY_PID) sigue activo: otras sesiones de opencode lo usan."
+    return 0
   fi
+  echo ""
+  echo "Cerrando proxy local de Gemini Web (PID $PROXY_PID)..."
+  kill "$PROXY_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-wait_for_health() {
-  python3 - <<'PY'
-import json, time, urllib.request
-deadline = time.time() + 15.0
-while time.time() < deadline:
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8100/health", timeout=1.0) as r:
-            if r.status == 200:
-                raise SystemExit(0)
-    except Exception:
-        time.sleep(0.25)
-raise SystemExit(1)
+# A /health field via python3 (no jq dependency); empty when the proxy doesn't answer.
+health_field() {
+  FIELD="$1" python3 - <<'PY' 2>/dev/null || true
+import json, os, urllib.request
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{os.environ['PROXY_PORT']}/health", timeout=1.0) as r:
+        v = json.loads(r.read().decode()).get(os.environ["FIELD"])
+        print("" if v is None else v)
+except Exception:
+    pass
 PY
 }
 
-wait_for_free_tab() {
-  python3 - <<'PY'
-import json, time, urllib.request
-deadline = time.time() + 20.0
+# Poll /health until a condition on it holds. $1: seconds, $2: python expression on `h`.
+wait_for() {
+  TIMEOUT="$1" COND="$2" python3 - <<'PY'
+import json, os, time, urllib.request
+deadline = time.time() + float(os.environ["TIMEOUT"])
+fresh = float(os.environ["COOKIES_FRESH_S"])
 while time.time() < deadline:
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8100/health", timeout=1.0) as r:
-            data = json.loads(r.read().decode())
-            if data.get("free_tabs", 0) > 0:
+        with urllib.request.urlopen(f"http://127.0.0.1:{os.environ['PROXY_PORT']}/health", timeout=1.0) as r:
+            h = json.loads(r.read().decode())
+            if eval(os.environ["COND"], {"h": h, "fresh": fresh}):
                 raise SystemExit(0)
+    except SystemExit:
+        raise
     except Exception:
         pass
     time.sleep(0.3)
@@ -53,36 +73,59 @@ PY
 }
 
 if ! lsof -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "Arrancando servidor proxy en puerto $PROXY_PORT..."
+  echo "Arrancando servidor proxy en puerto $PROXY_PORT (GEMINI_BACKEND=$GEMINI_BACKEND)..."
   cd "$REPO_DIR"
   uv run --active python main.py > "$LOG_FILE" 2>&1 &
   PROXY_PID=$!
   STARTED_PROXY=1
-  if ! wait_for_health; then
+  if ! wait_for 15 'True'; then
     echo "Error: el proxy no respondió en /health tras 15s (revisa $LOG_FILE)"
     exit 1
   fi
+else
+  RUNNING_MODE="$(health_field backend_mode)"
+  if [ -n "$RUNNING_MODE" ] && [ "$RUNNING_MODE" != "$GEMINI_BACKEND" ]; then
+    echo "Aviso: el proxy ya activo en el puerto $PROXY_PORT usa GEMINI_BACKEND=$RUNNING_MODE, no $GEMINI_BACKEND."
+    echo "       Ciérralo (lsof -ti tcp:$PROXY_PORT | xargs kill) para arrancarlo en modo $GEMINI_BACKEND."
+  fi
 fi
 
-# Abrir una pestaña limpia automáticamente salvo que se pase -c / --continue (retomar sesión)
-IS_CONTINUE=0
-for arg in "$@"; do
-  if [[ "$arg" == "-c" || "$arg" == "--continue" ]]; then
-    IS_CONTINUE=1
-    break
-  fi
-done
-
-if [ "$IS_CONTINUE" -eq 0 ] || ! pgrep -f "chrome-gemini-proxy" >/dev/null 2>&1; then
-  echo "Abriendo pestaña limpia de Gemini en Chrome aislado..."
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+start_chrome() {
+  "$CHROME_BIN" \
     --user-data-dir="$CHROME_PROFILE" \
     --use-mock-keychain \
     --no-first-run \
     --no-default-browser-check \
-    "https://gemini.google.com/app" >/dev/null 2>&1 &
-  if ! wait_for_free_tab; then
-    echo "Aviso: ninguna pestaña libre conectada tras 20s; continuando de todas formas..."
+    "$@" >/dev/null 2>&1 &
+}
+
+if [ "$GEMINI_BACKEND" = "chrome" ]; then
+  # DOM backend: a clean Gemini tab per launch, unless -c / --continue resumes a session.
+  IS_CONTINUE=0
+  for arg in "$@"; do
+    if [[ "$arg" == "-c" || "$arg" == "--continue" ]]; then
+      IS_CONTINUE=1
+      break
+    fi
+  done
+  if [ "$IS_CONTINUE" -eq 0 ] || ! pgrep -f "chrome-gemini-proxy" >/dev/null 2>&1; then
+    echo "Abriendo pestaña limpia de Gemini en Chrome aislado..."
+    start_chrome "https://gemini.google.com/app"
+    if ! wait_for 20 'h.get("free_tabs", 0) > 0'; then
+      echo "Aviso: ninguna pestaña libre conectada tras 20s; continuando de todas formas..."
+    fi
+  fi
+else
+  # api backend: Chrome only has to run with the profile, so the extension keeps
+  # the cookies fresh. No window: it stays in the background.
+  if ! pgrep -f "user-data-dir=$CHROME_PROFILE" >/dev/null 2>&1; then
+    echo "Arrancando Chrome aislado en segundo plano (proveedor de cookies)..."
+    start_chrome --no-startup-window
+  fi
+  if ! wait_for 20 'h.get("cookies_pushed_s_ago") is not None and h["cookies_pushed_s_ago"] < fresh'; then
+    echo "Aviso: la extensión no ha enviado cookies recientes tras 20s."
+    echo "       Carga $REPO_DIR/extension-cookies en el perfil $CHROME_PROFILE (chrome://extensions,"
+    echo "       Load unpacked) y revisa $LOG_FILE; continuando de todas formas..."
   fi
 fi
 

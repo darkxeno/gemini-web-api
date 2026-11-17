@@ -101,6 +101,12 @@ with the full prompt. Sessions run in parallel.
 `POST /v1/cookies` replaces the Google session every chat uses, so it is accepted
 only from this machine, as JSON, and without a web page's `Origin`.
 
+[`ocweb`](ocweb) launches OpenCode on this setup: it starts the proxy in `api`
+mode if none is running, starts the cookie profile's Chrome in the background (no
+Gemini tab), waits until `/health` shows fresh cookies, and leaves a shared proxy
+running while other OpenCode sessions use it. `GEMINI_BACKEND=chrome ocweb` keeps
+the tab-per-launch behaviour.
+
 ## Features
 
 | Capability | Status |
