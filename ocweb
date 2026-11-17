@@ -49,11 +49,57 @@ for arg in "$@"; do
   if [ "$arg" = "--selftest" ]; then SELFTEST=1; else ARGS+=("$arg"); fi
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
+# opencode itself: installed from a package manager when missing (Homebrew first,
+# else npm), never by piping a remote script into a shell.
 if [ "$SELFTEST" -eq 0 ] && ! command -v opencode >/dev/null 2>&1; then
-  echo "Error: opencode no está instalado (o no está en el PATH). Prueba: ocweb --selftest"
-  exit 1
+  echo "opencode no está instalado: instalándolo..."
+  if command -v brew >/dev/null 2>&1; then
+    brew install opencode
+  elif command -v npm >/dev/null 2>&1; then
+    npm install -g opencode-ai
+  else
+    echo "Error: no hay brew ni npm para instalar opencode (https://opencode.ai/docs/)."
+    exit 1
+  fi
+  hash -r
+  if ! command -v opencode >/dev/null 2>&1; then
+    echo "Error: opencode se instaló pero no está en el PATH."
+    exit 1
+  fi
 fi
 export GEMINI_PROXY_LOG="$LOG_FILE"
+
+# opencode's provider for this proxy (the block in the README). Written only when
+# the user has no opencode config at all: an existing one is never edited.
+OPENCODE_CONFIG_FILE="$HOME/.config/opencode/opencode.json"
+ensure_opencode_config() {
+  if [ -f "$OPENCODE_CONFIG_FILE" ]; then
+    if ! grep -q '"gemini-web"' "$OPENCODE_CONFIG_FILE"; then
+      echo "Aviso: $OPENCODE_CONFIG_FILE no tiene el proveedor \"gemini-web\"; añádelo"
+      echo "       (bloque en $REPO_DIR/README.md, sección opencode) para usar este proxy."
+    fi
+    return 0
+  fi
+  echo "Creando $OPENCODE_CONFIG_FILE con el proveedor gemini-web (puerto $PROXY_PORT)..."
+  mkdir -p "$(dirname "$OPENCODE_CONFIG_FILE")"
+  cat > "$OPENCODE_CONFIG_FILE" <<JSON
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "model": "gemini-web/gemini-3-flash",
+  "provider": {
+    "gemini-web": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Gemini Web (local)",
+      "options": { "baseURL": "http://localhost:$PROXY_PORT/v1", "apiKey": "not-needed" },
+      "models": {
+        "gemini-3-flash": { "name": "Gemini 3 Flash", "tools": true },
+        "gemini-3-pro": { "name": "Gemini 3 Pro", "tools": true }
+      }
+    }
+  }
+}
+JSON
+}
 
 STARTED_PROXY=0
 cleanup() {
@@ -184,5 +230,6 @@ if [ "$SELFTEST" -eq 1 ]; then
   exit $?
 fi
 
+ensure_opencode_config
 cd "$PROJECT_DIR"
 opencode "$@"
