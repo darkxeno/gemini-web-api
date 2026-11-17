@@ -41,7 +41,9 @@ Modos (GEMINI_BACKEND):
 Modelos (modo api; en opencode: -m gemini-web/<modelo>):
   gemini-4-hydrogen   por defecto, "Ayuda en tu día a día"
   gemini-flash-lite   el más rápido, "Respuestas rápidas"
-  La lista real de tu cuenta: curl -s localhost:8100/v1/models
+  gemini-pro          3.1 Pro, "Investigación detallada": lento (25–50 s) y a veces no responde
+  La lista real de tu cuenta: curl -s localhost:8100/v1/models. La configuración de
+  opencode se crea con esa lista la primera vez; para regenerarla, bórrala.
 
 Variables de entorno:
   GEMINI_BACKEND        modo (ver arriba)                        [api]
@@ -143,23 +145,44 @@ ensure_opencode_config() {
   fi
   echo "Creando $OPENCODE_CONFIG_FILE con el proveedor gemini-web (puerto $PROXY_PORT)..."
   mkdir -p "$(dirname "$OPENCODE_CONFIG_FILE")"
-  cat > "$OPENCODE_CONFIG_FILE" <<JSON
-{
-  "\$schema": "https://opencode.ai/config.json",
-  "model": "gemini-web/gemini-4-hydrogen",
-  "provider": {
-    "gemini-web": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Gemini Web (local)",
-      "options": { "baseURL": "http://localhost:$PROXY_PORT/v1", "apiKey": "not-needed" },
-      "models": {
-        "gemini-4-hydrogen": { "name": "Gemini 4 Hydrogen", "tools": true },
-        "gemini-flash-lite": { "name": "Gemini 3.5 Flash-Lite (rápido)", "tools": true }
-      }
+  # The models are the account's own, from the running proxy's /v1/models (the default
+  # first), named by Google's description. gemini-carbon is Argon asked the way that
+  # stalls, so it is left out. No proxy answer: Hydrogen and Flash-Lite.
+  OUT="$OPENCODE_CONFIG_FILE" python3 - <<'PY'
+import json, os, urllib.request
+
+port = os.environ["PROXY_PORT"]
+skip = {"gemini-carbon"}
+models = {}
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=40) as r:
+        for m in json.loads(r.read().decode())["data"]:
+            if m["id"] not in skip:
+                models[m["id"]] = {"name": m.get("description") or m["id"], "tools": True}
+except Exception:
+    pass
+if not models:
+    models = {
+        "gemini-4-hydrogen": {"name": "4 Hydrogen (Ayuda en tu día a día)", "tools": True},
+        "gemini-flash-lite": {"name": "3.5 Flash-Lite (Respuestas rápidas)", "tools": True},
     }
-  }
+config = {
+    "$schema": "https://opencode.ai/config.json",
+    "model": "gemini-web/" + next(iter(models)),
+    "provider": {
+        "gemini-web": {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Gemini Web (local)",
+            "options": {"baseURL": f"http://localhost:{port}/v1", "apiKey": "not-needed"},
+            "models": models,
+        }
+    },
 }
-JSON
+with open(os.environ["OUT"], "w", encoding="utf-8") as f:
+    json.dump(config, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+print("  modelos:", ", ".join(models), "| por defecto:", next(iter(models)))
+PY
 }
 
 STARTED_PROXY=0
