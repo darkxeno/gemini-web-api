@@ -20,7 +20,15 @@ if [ -z "${GEMINI_WEB_API_DIR:-}" ] && [ -f "$(dirname "$SELF")/main.py" ]; then
 fi
 REPO_DIR="${GEMINI_WEB_API_DIR:-$HOME/tools/gemini-web-api}"
 CHROME_PROFILE="$HOME/.chrome-gemini-proxy"
-CHROME_BIN="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+# The browser for the isolated cookie profile. Chromium (here: Chrome for Testing,
+# installed by `npx @puppeteer/browsers install chrome`) runs in its own profile and
+# autoloads the extension from the command line with --load-extension, so there is no
+# "Load unpacked" step. Point CHROME_BIN at any Chromium/Chrome binary to override.
+# Newest Chrome for Testing in the puppeteer cache (glob, highest version last).
+_cft_matches=("$HOME"/.cache/puppeteer/chrome/*/chrome-mac-*/'Google Chrome for Testing.app'/Contents/MacOS/'Google Chrome for Testing')
+_cft="${_cft_matches[${#_cft_matches[@]}-1]}"
+[ -x "$_cft" ] || _cft="/Applications/Chromium.app/Contents/MacOS/Chromium"
+CHROME_BIN="${CHROME_BIN:-$_cft}"
 # The extension pushes to 8100 unless told otherwise (chrome.storage.local {port}).
 PROXY_PORT="${GEMINI_API_PORT:-8100}"
 LOG_FILE="${GEMINI_PROXY_LOG:-/tmp/gemini-web-proxy.log}"
@@ -112,6 +120,12 @@ else
 fi
 
 start_chrome() {
+  if [ ! -x "$CHROME_BIN" ]; then
+    echo "Error: no se encontró Chromium en '$CHROME_BIN'."
+    echo "       Instálalo con: npx @puppeteer/browsers install chrome@stable"
+    echo "       (o 'brew install --cask chromium'), o define CHROME_BIN."
+    exit 1
+  fi
   "$CHROME_BIN" \
     --user-data-dir="$CHROME_PROFILE" \
     --use-mock-keychain \
@@ -119,6 +133,9 @@ start_chrome() {
     --no-default-browser-check \
     "$@" >/dev/null 2>&1 &
 }
+
+# api mode autoloads the cookie-provider extension; --load-extension needs it unpacked on disk.
+LOAD_EXT="--load-extension=$REPO_DIR/extension-cookies"
 
 if [ "$GEMINI_BACKEND" = "chrome" ]; then
   # DOM backend: a clean Gemini tab per launch, unless -c / --continue resumes a session.
@@ -137,20 +154,19 @@ if [ "$GEMINI_BACKEND" = "chrome" ]; then
     fi
   fi
 else
-  # api backend: Chrome only has to run with the profile, so the extension keeps
-  # the cookies fresh. No window: it stays in the background.
+  # api backend: the isolated Chromium only has to run with the extension autoloaded,
+  # which keeps the cookies fresh. No window: it stays in the background.
   if ! pgrep -f "user-data-dir=$CHROME_PROFILE" >/dev/null 2>&1; then
-    echo "Arrancando Chrome aislado en segundo plano (proveedor de cookies)..."
-    start_chrome --no-startup-window
+    echo "Arrancando Chromium aislado en segundo plano (proveedor de cookies)..."
+    start_chrome "$LOAD_EXT" --no-startup-window
   fi
   FRESH='h.get("cookies_pushed_s_ago") is not None and h["cookies_pushed_s_ago"] < fresh'
   if ! wait_for 20 "$FRESH"; then
-    # First run (or the extension isn't loaded / signed out): one-time setup in a window.
-    echo "No llegan cookies de la extensión. Abriendo Chrome aislado para configurarlo (una sola vez):"
-    echo "  1. Inicia sesión en Google en esa ventana."
-    echo "  2. En chrome://extensions activa 'Developer mode' -> 'Load unpacked' -> $REPO_DIR/extension-cookies"
+    # First run (or signed out): the extension is already loaded, so only sign-in is left.
+    echo "No llegan cookies de la extensión. Abriendo Chromium para iniciar sesión (una sola vez):"
+    echo "  Inicia sesión en Google en esa ventana. La extensión ya está cargada."
     echo "Esperando hasta 5 minutos a la primera subida de cookies..."
-    start_chrome "https://accounts.google.com/" "chrome://extensions/"
+    start_chrome "$LOAD_EXT" "https://accounts.google.com/" >/dev/null 2>&1
     if ! wait_for 300 "$FRESH"; then
       echo "Aviso: sin cookies recientes de la extensión tras 5 minutos (revisa $LOG_FILE); continuando de todas formas..."
     fi

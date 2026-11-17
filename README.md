@@ -78,9 +78,11 @@ protocol are documented at the top of [`gemini_openai/chrome_backend.py`](gemini
 Direct HTTP (`StreamGenerate`, like `webapi`) with the browser as the cookie
 source, so nothing scrapes a page or waits on a background tab:
 
-1. Load [`extension-cookies/`](extension-cookies/) unpacked, in the Chrome
-   profile signed in to Google (it can be a dedicated `--user-data-dir`). It has
-   no content scripts. It POSTs the `.google.com` cookie jar to
+1. Run [`extension-cookies/`](extension-cookies/) in a Chromium browser with its
+   own profile, signed in to Google. `ocweb` does this: Chrome for Testing
+   (`npx @puppeteer/browsers install chrome@stable`) or Chromium, with
+   `--user-data-dir=~/.chrome-gemini-proxy --load-extension=extension-cookies`, so
+   there is no "Load unpacked" step. It has no content scripts. It POSTs the `.google.com` cookie jar to
    `localhost:8100/v1/cookies` when its worker starts, whenever
    `__Secure-1PSID`/`__Secure-1PSIDTS` change, and every 8 minutes right after
    asking Google to rotate `__Secure-1PSIDTS` (`RotateCookies`, through Chrome's
@@ -106,10 +108,9 @@ with the full prompt. Sessions run in parallel.
 only from this machine, as JSON, and without a web page's `Origin`.
 
 [`ocweb`](ocweb) (run it from the repo, or symlink it onto your PATH) launches
-OpenCode on this setup -- on first run it opens the profile's Chrome to sign in and
-load the extension; it starts the proxy in `api`
-mode if none is running, starts the cookie profile's Chrome in the background (no
-Gemini tab), waits until `/health` shows fresh cookies, and leaves a shared proxy
+OpenCode on this setup -- on first run it opens the profile's Chromium to sign in
+to Google; it starts the proxy in `api` mode if none is running, starts the cookie
+profile's Chromium with the extension in the background (no Gemini tab), waits until `/health` shows fresh cookies, and leaves a shared proxy
 running while other OpenCode sessions use it. `GEMINI_BACKEND=chrome ocweb` keeps
 the tab-per-launch behaviour. `ocweb --selftest` runs a live two-turn chat instead
 of OpenCode and checks the second turn continued the first one's Gemini thread
