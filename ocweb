@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(pwd)"
+REPO_DIR="$HOME/tools/gemini-web-api"
+EXT_DIR="$REPO_DIR/extension"
+CHROME_PROFILE="$HOME/.chrome-gemini-proxy"
+PROXY_PORT="8100"
+LOG_FILE="/tmp/gemini-web-proxy.log"
+
+export GEMINI_BACKEND="chrome"
+
+STARTED_PROXY=0
+cleanup() {
+  if [ "$STARTED_PROXY" -eq 1 ] && [ -n "${PROXY_PID:-}" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo ""
+    echo "Cerrando proxy local de Gemini Web (PID $PROXY_PID)..."
+    kill "$PROXY_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+wait_for_health() {
+  python3 - <<'PY'
+import json, time, urllib.request
+deadline = time.time() + 15.0
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8100/health", timeout=1.0) as r:
+            if r.status == 200:
+                raise SystemExit(0)
+    except Exception:
+        time.sleep(0.25)
+raise SystemExit(1)
+PY
+}
+
+wait_for_free_tab() {
+  python3 - <<'PY'
+import json, time, urllib.request
+deadline = time.time() + 20.0
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8100/health", timeout=1.0) as r:
+            data = json.loads(r.read().decode())
+            if data.get("free_tabs", 0) > 0:
+                raise SystemExit(0)
+    except Exception:
+        pass
+    time.sleep(0.3)
+raise SystemExit(1)
+PY
+}
+
+if ! lsof -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Arrancando servidor proxy en puerto $PROXY_PORT..."
+  cd "$REPO_DIR"
+  uv run --active python main.py > "$LOG_FILE" 2>&1 &
+  PROXY_PID=$!
+  STARTED_PROXY=1
+  if ! wait_for_health; then
+    echo "Error: el proxy no respondió en /health tras 15s (revisa $LOG_FILE)"
+    exit 1
+  fi
+fi
+
+# Abrir una pestaña limpia automáticamente salvo que se pase -c / --continue (retomar sesión)
+IS_CONTINUE=0
+for arg in "$@"; do
+  if [[ "$arg" == "-c" || "$arg" == "--continue" ]]; then
+    IS_CONTINUE=1
+    break
+  fi
+done
+
+if [ "$IS_CONTINUE" -eq 0 ] || ! pgrep -f "chrome-gemini-proxy" >/dev/null 2>&1; then
+  echo "Abriendo pestaña limpia de Gemini en Chrome aislado..."
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    --user-data-dir="$CHROME_PROFILE" \
+    --use-mock-keychain \
+    --no-first-run \
+    --no-default-browser-check \
+    "https://gemini.google.com/app" >/dev/null 2>&1 &
+  if ! wait_for_free_tab; then
+    echo "Aviso: ninguna pestaña libre conectada tras 20s; continuando de todas formas..."
+  fi
+fi
+
+cd "$PROJECT_DIR"
+opencode "$@"
