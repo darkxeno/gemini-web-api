@@ -2,7 +2,7 @@
 # opencode against the local gemini-web-api proxy.
 #
 # Default GEMINI_BACKEND=api: the proxy talks to Gemini over HTTP with the cookies
-# the cookie-provider extension (extension-cookies/, loaded once in $CHROME_PROFILE)
+# the cookie-provider extension (extension-cookies/, autoloaded in an isolated Chromium)
 # pushes. Chrome only has to be running with that profile -- no Gemini tab, so
 # any number of ocweb terminals run in parallel, each on its own Gemini thread.
 # GEMINI_BACKEND=chrome ocweb keeps the old behaviour (a fresh Gemini tab per launch).
@@ -19,16 +19,6 @@ if [ -z "${GEMINI_WEB_API_DIR:-}" ] && [ -f "$(dirname "$SELF")/main.py" ]; then
   GEMINI_WEB_API_DIR="$(dirname "$SELF")"
 fi
 REPO_DIR="${GEMINI_WEB_API_DIR:-$HOME/tools/gemini-web-api}"
-CHROME_PROFILE="$HOME/.chrome-gemini-proxy"
-# The browser for the isolated cookie profile. Chromium (here: Chrome for Testing,
-# installed by `npx @puppeteer/browsers install chrome`) runs in its own profile and
-# autoloads the extension from the command line with --load-extension, so there is no
-# "Load unpacked" step. Point CHROME_BIN at any Chromium/Chrome binary to override.
-# Newest Chrome for Testing in the puppeteer cache (glob, highest version last).
-_cft_matches=("$HOME"/.cache/puppeteer/chrome/*/chrome-mac-*/'Google Chrome for Testing.app'/Contents/MacOS/'Google Chrome for Testing')
-_cft="${_cft_matches[${#_cft_matches[@]}-1]}"
-[ -x "$_cft" ] || _cft="/Applications/Chromium.app/Contents/MacOS/Chromium"
-CHROME_BIN="${CHROME_BIN:-$_cft}"
 # The extension pushes to 8100 unless told otherwise (chrome.storage.local {port}).
 PROXY_PORT="${GEMINI_API_PORT:-8100}"
 LOG_FILE="${GEMINI_PROXY_LOG:-/tmp/gemini-web-proxy.log}"
@@ -36,6 +26,20 @@ LOG_FILE="${GEMINI_PROXY_LOG:-/tmp/gemini-web-proxy.log}"
 COOKIES_FRESH_S=900
 
 export GEMINI_BACKEND="${GEMINI_BACKEND:-api}"
+
+# The browser and its isolated profile, per mode:
+#   api    -> Chromium (the standard build in ~/Applications/Chromium.app, installed from
+#             the official chromium-browser-snapshots), its own profile, and the
+#             cookie-provider extension autoloaded with --load-extension: no "Load unpacked".
+#   chrome -> Google Chrome with the DOM extension's profile, as before.
+# CHROME_BIN / CHROME_PROFILE override either.
+if [ "$GEMINI_BACKEND" = "chrome" ]; then
+  CHROME_BIN="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  CHROME_PROFILE="${CHROME_PROFILE:-$HOME/.chrome-gemini-proxy}"
+else
+  CHROME_BIN="${CHROME_BIN:-$HOME/Applications/Chromium.app/Contents/MacOS/Chromium}"
+  CHROME_PROFILE="${CHROME_PROFILE:-$HOME/.chromium-gemini-proxy}"
+fi
 export PROXY_PORT COOKIES_FRESH_S
 export GEMINI_API_PORT="$PROXY_PORT"
 
@@ -121,9 +125,10 @@ fi
 
 start_chrome() {
   if [ ! -x "$CHROME_BIN" ]; then
-    echo "Error: no se encontró Chromium en '$CHROME_BIN'."
-    echo "       Instálalo con: npx @puppeteer/browsers install chrome@stable"
-    echo "       (o 'brew install --cask chromium'), o define CHROME_BIN."
+    echo "Error: no se encontró el navegador en '$CHROME_BIN'."
+    echo "       Chromium estándar: descarga chrome-mac.zip de"
+    echo "       https://commondatastorage.googleapis.com/chromium-browser-snapshots/index.html?prefix=Mac_Arm/"
+    echo "       y deja Chromium.app en ~/Applications, o define CHROME_BIN."
     exit 1
   fi
   "$CHROME_BIN" \
@@ -146,7 +151,7 @@ if [ "$GEMINI_BACKEND" = "chrome" ]; then
       break
     fi
   done
-  if [ "$IS_CONTINUE" -eq 0 ] || ! pgrep -f "chrome-gemini-proxy" >/dev/null 2>&1; then
+  if [ "$IS_CONTINUE" -eq 0 ] || ! pgrep -f "user-data-dir=$CHROME_PROFILE" >/dev/null 2>&1; then
     echo "Abriendo pestaña limpia de Gemini en Chrome aislado..."
     start_chrome "https://gemini.google.com/app"
     if ! wait_for 20 'h.get("free_tabs", 0) > 0'; then

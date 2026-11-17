@@ -78,11 +78,13 @@ protocol are documented at the top of [`gemini_openai/chrome_backend.py`](gemini
 Direct HTTP (`StreamGenerate`, like `webapi`) with the browser as the cookie
 source, so nothing scrapes a page or waits on a background tab:
 
-1. Run [`extension-cookies/`](extension-cookies/) in a Chromium browser with its
-   own profile, signed in to Google. `ocweb` does this: Chrome for Testing
-   (`npx @puppeteer/browsers install chrome@stable`) or Chromium, with
-   `--user-data-dir=~/.chrome-gemini-proxy --load-extension=extension-cookies`, so
-   there is no "Load unpacked" step. It has no content scripts. It POSTs the `.google.com` cookie jar to
+1. Run [`extension-cookies/`](extension-cookies/) in Chromium with its own profile,
+   signed in to Google. `ocweb` does this with the standard Chromium build in
+   `~/Applications/Chromium.app` (`chrome-mac.zip` from the official
+   [chromium-browser-snapshots](https://commondatastorage.googleapis.com/chromium-browser-snapshots/index.html?prefix=Mac_Arm/);
+   Homebrew's cask is disabled), `--user-data-dir=~/.chromium-gemini-proxy` and
+   `--load-extension=extension-cookies`, so there is no "Load unpacked" step. It
+   has no content scripts. It POSTs the `.google.com` cookie jar to
    `localhost:8100/v1/cookies` when its worker starts, whenever
    `__Secure-1PSID`/`__Secure-1PSIDTS` change, and every 8 minutes right after
    asking Google to rotate `__Secure-1PSIDTS` (`RotateCookies`, through Chrome's
