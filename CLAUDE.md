@@ -133,6 +133,17 @@ Both backends **always load**; `server.py:pick_manager()` routes each chat reque
   `GEMINI_MEDIA_{ATTEMPT_TIMEOUT,QUOTA_COOLDOWN,EXCLUDE_AUTHUSERS}`). See devlog
   `claude_2026-08-01-parallel-tab-pool.md`.
 
+  **Chat sessions** (branch `custom-opencode-bridge`): each conversation
+  (`openai_schemas.session_key`: system prompt start + first user message) is
+  pinned to one tab. Its first turn opens a new Gemini conversation with the full
+  prompt; later turns send only `continuation()` (everything after the last
+  assistant message) into it. A session that can't prove its tab still shows its
+  conversation (tab gone, moved, retried, evicted LRU by a new session) starts
+  over with the full prompt -- never continue a conversation by guesswork. Tabs
+  report SPA navigation as `url_changed` (polled: the isolated world can't hook
+  `history.pushState`); pins survive restarts via `GEMINI_SESSION_MAP`
+  (default `/tmp/gemini-session-map.json`). Test: `tests/session_test.py`.
+
 `config.BACKEND` is a **preference** for chat: `auto` (default — extension when
 a tab is connected, else cookies; vision always cookies), `webapi` (always
 cookies — what `~/bin/gemini-web-api-server` runs), `chrome` (always extension,
