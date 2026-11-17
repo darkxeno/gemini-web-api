@@ -127,7 +127,11 @@ generic refusal ("Soy un modelo de lenguaje...") that the client receives as the
 The web app itself sends messages over `processSession` with an anti-bot token.
 `GEMINI_ARGON_THINKING` sets the web's reasoning level: 1 low, 4 medium (default), 2 high.
 
-The opencode config `ocweb` writes sets `small_model` to `gemini-flash-lite` when the
+[`opencode.example.json`](opencode.example.json) is that config for an account with
+Hydrogen, Flash-Lite, Pro and Argon, ready to copy into `~/.config/opencode/opencode.json`
+(or merge its `model`, `small_model` and `provider.gemini-web` into an existing one); it
+needs the proxy in `api` mode on port 8100. The opencode config `ocweb` writes itself
+lists the account's own models and sets `small_model` to `gemini-flash-lite` when the
 account has it: opencode's own small tasks (session titles, summaries) go to the fastest
 model, while the model for the actual work is the user's choice (`/models` in opencode).
 

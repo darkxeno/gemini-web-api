@@ -46,7 +46,8 @@ Modelos (modo api; en opencode: -m gemini-web/<modelo>):
                       devuelve un rechazo genérico ("Soy un modelo de lenguaje...")
   La lista real de tu cuenta: curl -s localhost:8100/v1/models. La configuración de
   opencode se crea con esa lista la primera vez (con small_model = gemini-flash-lite para
-  los títulos y resúmenes que genera opencode); para regenerarla, bórrala.
+  los títulos y resúmenes que genera opencode); para regenerarla, bórrala. Una copia lista
+  para pegar o fusionar: opencode.example.json en el repo.
 
 Variables de entorno:
   GEMINI_BACKEND        modo (ver arriba)                        [api]
