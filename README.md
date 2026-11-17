@@ -114,10 +114,18 @@ Models in `api` mode are the account's own: `/v1/models` lists its registry
 first, and those names are passed through as-is. The default is `gemini-4-hydrogen`
 ("4 Hydrogen", the web app's default; `GEMINI_DEFAULT_MODEL` overrides it). Avoid
 `gemini-pro` where it is "Investigación detallada" (deep research: slow, sometimes no
-reply) and Argon (`95a4c0abcba24364`, listed as `gemini-carbon`): it stalls over the
-library's `StreamGenerate` since Google's 2026-11-12 web build, while the web app now
-sends messages through `geminiweb-pa.clients6.google.com/v1/processSession`
-([gemini-webapi #374](https://github.com/HanaokaYuzu/Gemini-API/issues/374)).
+reply).
+
+`gemini-argon` ("4 Argon", "Código y análisis"; also `argon`, `gemini-4-argon`) is
+**experimental**. Since Google's 2026-11-12 web build it stalls over StreamGenerate as
+gemini-webapi selects it -- registry id `95a4c0abcba24364`, listed as `gemini-carbon`
+([gemini-webapi #374](https://github.com/HanaokaYuzu/Gemini-API/issues/374)). With the
+model header in the web app's shape (slug, reasoning level, capability list, language,
+web build), which [`web_models.py`](gemini_openai/web_models.py) rewrites on the way
+out, it sometimes answers: 1 of 6 tries on 2026-11-17. The others stalled, or got a
+generic refusal ("Soy un modelo de lenguaje...") that the client receives as the reply.
+The web app itself sends messages over `processSession` with an anti-bot token.
+`GEMINI_ARGON_THINKING` sets the web's reasoning level: 1 low, 4 medium (default), 2 high.
 
 [`ocweb`](ocweb) (run it from the repo, or symlink it onto your PATH) launches
 OpenCode on this setup -- on first run it opens the profile's Chromium to sign in

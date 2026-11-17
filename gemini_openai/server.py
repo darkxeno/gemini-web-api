@@ -21,7 +21,7 @@ import os
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from . import config, tools as tools_mod, video as video_mod
+from . import config, tools as tools_mod, video as video_mod, web_models
 from .openai_schemas import (
     ChatCompletionRequest,
     chunk,
@@ -248,8 +248,15 @@ async def list_models(_=Depends(check_key)) -> dict:
             client = await asyncio.wait_for(webapi_manager.get(), 30)
             account = [m for m in (client.list_models() or []) if m.is_available]
             if account:
-                names = [m.model_name for m in account]
-                described = {m.model_name: f"{m.description} ({m.display_name})" for m in account}
+                # Models asked for the web app's way replace their registry entry
+                # (Argon is listed as gemini-carbon, which stalls as listed).
+                web = {m.registry_id: m for m in web_models.MODELS.values()}
+                names, described = [], {}
+                for m in account:
+                    w = web.get(getattr(m, "model_id", None))
+                    name = w.name if w else m.model_name
+                    names.append(name)
+                    described[name] = w.description if w else f"{m.description} ({m.display_name})"
         except Exception as e:  # noqa: BLE001
             print(f"[models] account registry unavailable ({type(e).__name__}: {e}); "
                   f"listing the static names", flush=True)

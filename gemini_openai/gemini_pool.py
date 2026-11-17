@@ -23,7 +23,7 @@ import asyncio
 from gemini_webapi import GeminiClient
 from gemini_webapi.exceptions import APIError, AuthError
 
-from . import config
+from . import config, web_models
 from .sessions import CURRENT_CHAT, ApiSessionStore, ChatSession
 
 # Errors worth a one-shot re-init + retry: auth expiry, and transient Google
@@ -45,6 +45,10 @@ def _for_account(client: GeminiClient, kwargs: dict) -> dict:
     (2.0.x) pass through untouched.
     """
     name = kwargs.get("model")
+    web = web_models.lookup(name) if config.BACKEND == "api" else None
+    if web is not None:
+        # Asked for the web app's way (web_models): the registry entry stalls.
+        return {**kwargs, "model": web_models.library_model(web)}
     resolve = getattr(client, "resolve_model", None)
     if not isinstance(name, str) or resolve is None:
         return kwargs
@@ -115,6 +119,10 @@ class GeminiManager:
             auto_refresh=config.rotate_cookies_ourselves(),
             refresh_interval=540,
         )
+        if api_mode:
+            web_models.set_session(getattr(client, "language", None),
+                                   getattr(client, "build_label", None))
+            web_models.install()
         if api_mode and (not getattr(client, "access_token", None)
                          or getattr(client, "_cookie_source", "") == "Guest"):
             # When no cookie group authenticates, gemini_webapi falls back to a
