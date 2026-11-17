@@ -56,7 +56,7 @@ Variables de entorno:
   CHROME_BIN            navegador  [api: ~/Applications/Chromium.app; chrome: Google Chrome]
   CHROME_PROFILE        perfil     [api: ~/.chromium-gemini-proxy; chrome: ~/.chrome-gemini-proxy]
   GEMINI_WEB_API_DIR    repo de gemini-web-api [el de este script, o ~/tools/gemini-web-api]
-  GEMINI_PROXY_LOG      log del proxy                            [/tmp/gemini-web-proxy.log]
+  GEMINI_PROXY_LOG      log del proxy                            [$REPO_DIR/logs/server.log]
   SELFTEST_MODEL        modelo para --selftest                   [el primero de /v1/models]
   GEMINI_REQUEST_LOG    métricas por petición; "off" las apaga  [~/.gemini-web-api/requests.jsonl]
   GEMINI_TOOLS_PROMPT   cómo se ofrecen las herramientas         [actions; legacy = las antiguas]
@@ -92,7 +92,7 @@ fi
 REPO_DIR="${GEMINI_WEB_API_DIR:-$HOME/tools/gemini-web-api}"
 # The extension pushes to 8100 unless told otherwise (chrome.storage.local {port}).
 PROXY_PORT="${GEMINI_API_PORT:-8100}"
-LOG_FILE="${GEMINI_PROXY_LOG:-/tmp/gemini-web-proxy.log}"
+LOG_FILE="${GEMINI_PROXY_LOG:-$REPO_DIR/logs/server.log}"
 # Used by wait_for's conditions (kept for custom ones).
 COOKIES_FRESH_S=900
 
@@ -249,7 +249,9 @@ PY
 if ! lsof -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "Arrancando servidor proxy en puerto $PROXY_PORT (GEMINI_BACKEND=$GEMINI_BACKEND)..."
   cd "$REPO_DIR"
-  uv run --active python main.py > "$LOG_FILE" 2>&1 &
+  mkdir -p "$(dirname "$LOG_FILE")"
+  printf '\n=== Start %s (backend=%s, port=%s) ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$GEMINI_BACKEND" "$PROXY_PORT" >> "$LOG_FILE"
+  uv run --active python main.py >> "$LOG_FILE" 2>&1 &
   PROXY_PID=$!
   STARTED_PROXY=1
   if ! wait_for 15 'True'; then

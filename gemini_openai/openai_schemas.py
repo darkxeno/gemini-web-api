@@ -49,6 +49,7 @@ class ChatCompletionRequest(BaseModel):
     n: int | None = None
     stop: Any | None = None
     user: str | None = None
+    stream_options: dict | None = None
 
     model_config = {
         "json_schema_extra": {
@@ -232,4 +233,19 @@ def chunk(model: str, rid: str, created: int, delta: dict, finish: str | None = 
         "created": created,
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }
+
+
+def usage_chunk(model: str, rid: str, created: int, prompt_tokens: int, completion_tokens: int) -> dict:
+    return {
+        "id": rid,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
     }
