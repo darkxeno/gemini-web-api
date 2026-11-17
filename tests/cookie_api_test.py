@@ -395,3 +395,12 @@ def test_no_push_yet_names_the_extension(monkeypatch):
     monkeypatch.delenv("GEMINI_1PSID", raising=False)
     with pytest.raises(gp.AuthError, match="extension-cookies"):
         asyncio.run(gp.GeminiManager()._make_client())
+
+
+def test_health_says_whether_cookies_came_since_this_server_started(api, monkeypatch):
+    """A jar stored by an earlier run may have been invalidated by a rotation since."""
+    monkeypatch.setattr(config, "_pushed_since_start", False)
+    client, _ = api
+    assert asyncio.run(server.health())["cookies_pushed_since_start"] is False
+    push(client)
+    assert asyncio.run(server.health())["cookies_pushed_since_start"] is True

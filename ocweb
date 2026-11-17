@@ -22,7 +22,7 @@ REPO_DIR="${GEMINI_WEB_API_DIR:-$HOME/tools/gemini-web-api}"
 # The extension pushes to 8100 unless told otherwise (chrome.storage.local {port}).
 PROXY_PORT="${GEMINI_API_PORT:-8100}"
 LOG_FILE="${GEMINI_PROXY_LOG:-/tmp/gemini-web-proxy.log}"
-# The extension pushes on start and every 8 minutes: older than this means it isn't running.
+# Used by wait_for's conditions (kept for custom ones).
 COOKIES_FRESH_S=900
 
 export GEMINI_BACKEND="${GEMINI_BACKEND:-api}"
@@ -211,8 +211,11 @@ else
     echo "Arrancando Chromium aislado en segundo plano (proveedor de cookies)..."
     start_chrome "$LOAD_EXT" --no-startup-window
   fi
-  FRESH='h.get("cookies_pushed_s_ago") is not None and h["cookies_pushed_s_ago"] < fresh'
-  if ! wait_for 20 "$FRESH"; then
+  # A push to THIS proxy, not just a recent cookies.json: Chromium may have rotated the
+  # session while no proxy was running, which leaves the stored jar invalid. The
+  # extension feeds a (re)started proxy within a minute.
+  FRESH='h.get("cookies_pushed_since_start")'
+  if ! wait_for 75 "$FRESH"; then
     # First run (or signed out): the extension is already loaded, so only sign-in is left.
     echo "No llegan cookies de la extensión. Abriendo Chromium para iniciar sesión (una sola vez):"
     echo "  Inicia sesión en Google en esa ventana. La extensión ya está cargada."

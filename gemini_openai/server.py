@@ -263,6 +263,8 @@ async def health() -> dict:
         "free_tabs": len(free),
         # api mode: seconds since the cookie-provider extension last pushed (None: never)
         "cookies_pushed_s_ago": _rounded(config.pushed_age()),
+        # ...and whether it pushed to this server process (the stored jar can be stale)
+        "cookies_pushed_since_start": config.pushed_since_start(),
     }
 
 

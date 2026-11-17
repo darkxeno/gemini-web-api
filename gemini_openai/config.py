@@ -193,6 +193,9 @@ def rotate_cookies_ourselves() -> bool:
 # values nor anything derived from __Secure-1PSID but a short hash is ever printed.
 COOKIE_STORE = Path(os.getenv("GEMINI_COOKIE_STORE", "~/.gemini-web-api/cookies.json")).expanduser()
 _pushed: dict | None = None  # {"jar": {name: value}, "pushed_at": epoch seconds}
+# Whether the extension pushed to THIS process: a stored jar may predate a rotation
+# Chrome made while the server was down, which invalidated it.
+_pushed_since_start = False
 
 
 def _load_pushed() -> dict:
@@ -219,10 +222,16 @@ def pushed_age() -> float | None:
     return time.time() - at if isinstance(at, (int, float)) else None
 
 
+def pushed_since_start() -> bool:
+    """Whether the extension pushed since this server started."""
+    return _pushed_since_start
+
+
 def store_pushed_jar(jar: dict[str, str]) -> None:
     """Keep the extension's cookies in memory and on disk (0600, atomic)."""
-    global _pushed
+    global _pushed, _pushed_since_start
     _pushed = {"jar": dict(jar), "pushed_at": time.time()}
+    _pushed_since_start = True
     COOKIE_STORE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = COOKIE_STORE.with_name(COOKIE_STORE.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

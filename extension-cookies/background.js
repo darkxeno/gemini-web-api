@@ -7,6 +7,9 @@
  *
  *   - when the worker starts (browser start, extension install/reload);
  *   - whenever __Secure-1PSID or __Secure-1PSIDTS changes;
+ *   - every minute while the server runs, when the jar changed since its last
+ *     push or the server restarted (its /health says no push yet): a rotation
+ *     made while the server was down reaches it within a minute of its start;
  *   - every 8 minutes, right after asking Google to rotate __Secure-1PSIDTS
  *     (accounts.google.com/RotateCookies, through Chrome's own network stack and
  *     cookie jar, as an open Google page would). Chrome owns the session, so the
@@ -25,11 +28,24 @@ const ROTATE_URL = "https://accounts.google.com/RotateCookies";
 const ROTATE_EVERY_MIN = 8;
 const LOG = (...a) => console.log("[GCP]", ...a);
 
-// The last body the server accepted, so unchanged jars aren't re-sent. Lost when
-// the worker idles out; the next push then simply goes again.
-let lastSent = "";
+// The last body the server accepted, so unchanged jars aren't re-sent. In
+// storage.session: the worker idles out every ~30s and would forget it.
 let pushTimer = null;
 let lastRotation = null; // {status, at}
+
+async function getLastSent() {
+  try {
+    return (await chrome.storage.session.get(["lastSent"])).lastSent || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+async function setLastSent(body) {
+  try {
+    await chrome.storage.session.set({ lastSent: body });
+  } catch (e) {}
+}
 
 async function serverPort() {
   try {
@@ -63,11 +79,11 @@ async function push(reason, { force = false } = {}) {
     cookies,
     rotation: lastRotation,
   });
-  if (!force && body === lastSent) return;
+  if (!force && body === (await getLastSent())) return;
   const url = `http://localhost:${await serverPort()}/v1/cookies`;
   try {
     const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body });
-    if (r.ok) lastSent = body;
+    if (r.ok) await setLastSent(body);
     LOG(`${reason}: pushed ${Object.keys(cookies).length} cookies -> HTTP ${r.status}`);
   } catch (e) {
     LOG(`${reason}: server not reachable at ${url} (${e.message}); the next change or alarm retries`);
@@ -104,16 +120,43 @@ chrome.cookies.onChanged.addListener(({ cookie, removed }) => {
   pushSoon(`${cookie.name} changed`);
 });
 
+// Feed a running server what it lacks: a changed jar, or everything if it restarted.
+async function sync() {
+  let health = null;
+  try {
+    const r = await fetch(`http://localhost:${await serverPort()}/health`);
+    if (r.ok) health = await r.json();
+  } catch (e) {
+    return; // not running: nothing to feed
+  }
+  if (!health) return;
+  await push("sync", { force: !health.cookies_pushed_since_start });
+}
+
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name !== "gcp-rotate") return;
-  await rotate();
-  await push("periodic", { force: true }); // also re-feeds a server that restarted
+  if (alarm.name === "gcp-sync") {
+    await sync();
+  } else if (alarm.name === "gcp-rotate") {
+    await rotate();
+    await push("periodic", { force: true });
+  }
 });
 
+// Created only when missing: re-creating an alarm restarts its period, and the
+// worker wakes every minute -- the 8-minute rotation would never come due.
+async function ensureAlarm(name, periodInMinutes) {
+  if (!(await chrome.alarms.get(name))) chrome.alarms.create(name, { periodInMinutes });
+}
+
 function start(reason) {
-  chrome.alarms.create("gcp-rotate", { periodInMinutes: ROTATE_EVERY_MIN });
+  ensureAlarm("gcp-rotate", ROTATE_EVERY_MIN);
+  ensureAlarm("gcp-sync", 1);
   push(reason, { force: true });
 }
+
+// Every worker start (also after it idled out): the alarms must exist.
+ensureAlarm("gcp-rotate", ROTATE_EVERY_MIN);
+ensureAlarm("gcp-sync", 1);
 
 chrome.runtime.onInstalled.addListener(() => start("installed/reloaded"));
 chrome.runtime.onStartup.addListener(() => start("browser-startup"));
