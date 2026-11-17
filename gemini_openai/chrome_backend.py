@@ -1,22 +1,3 @@
-from __future__ import annotations
-
-import json
-from pathlib import Path
-SESSION_MAP_FILE = Path("/tmp/gemini-session-map.json")
-
-def _load_session_map() -> dict[str, str]:
-    try:
-        return json.loads(SESSION_MAP_FILE.read_text(encoding="utf-8")) if SESSION_MAP_FILE.exists() else {}
-    except Exception:
-        return {}
-
-def _save_session_map(data: dict[str, str]) -> None:
-    try:
-        SESSION_MAP_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-from .openai_schemas import CURRENT_SESSION_KEY
 """Chrome-extension backend: drive logged-in gemini.google.com tabs.
 
 An alternative to the cookie/CDP gemini_webapi backend (gemini_pool.py). Instead
@@ -38,19 +19,32 @@ the Google multi-login account (`authuser`) its URL is on, which lets callers
 prefer a tab on a specific account. Tabs running an older content script that
 sends a bare hello still work -- they get an auto-generated id and no authuser.
 
+A chat that carries a session (`CURRENT_CHAT`, set by server.py per request) is
+PINNED to one tab: its first turn starts a new Gemini conversation there with
+the full prompt, and later turns send only what is new since the model's last
+reply into that same conversation. A session whose tab is gone, has moved to
+another conversation, or failed starts over in a new conversation with the full
+prompt -- never continuing a conversation it doesn't own. Pins survive a server
+restart through the session map file (session -> conversation URL).
+
 WS protocol (server <-> extension):
-    server -> ext : {"type":"chat"|"image"|"video","id","prompt",...}
-    ext -> server : {"type":"hello","tabId","authuser","href"}
+    server -> ext : {"type":"chat"|"image"|"video","id","prompt","fresh",...}
+    ext -> server : {"type":"hello","tabId","authuser","href","worker"}
+                    {"type":"url_changed","tabId","href","worker"}  (SPA navigation)
+                    {"type":"ka"}  (keepalive, ignored)
                     {"type":"delta","id","text"} | {"type":"result","id","text","media"?}
                     {"type":"error","id","message"}
 """
+from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -73,6 +67,44 @@ MEDIA_EXCLUDE_AUTHUSERS = {
     a.strip() for a in os.environ.get("GEMINI_MEDIA_EXCLUDE_AUTHUSERS", "").split(",")
     if a.strip()
 }
+
+# Session -> conversation URL, so pins survive a server restart. Capped: the
+# oldest sessions drop out first.
+SESSION_MAP_FILE = Path(os.environ.get("GEMINI_SESSION_MAP", "/tmp/gemini-session-map.json"))
+SESSION_MAP_MAX = 500
+
+# A tab inside a conversation, not on a bare /app.
+IN_CONVERSATION = re.compile(r"/app/[0-9a-f]{6,}")
+
+
+@dataclass(frozen=True)
+class ChatSession:
+    """The conversation a chat request belongs to (see server.py)."""
+
+    key: str
+    # What to send to a tab that already holds the conversation: the messages
+    # since the model's last reply. None on a first turn.
+    continuation: str | None = None
+
+
+CURRENT_CHAT: contextvars.ContextVar[ChatSession | None] = contextvars.ContextVar(
+    "CURRENT_CHAT", default=None
+)
+
+
+def _load_session_map() -> dict[str, str]:
+    try:
+        data = json.loads(SESSION_MAP_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _save_session_map(data: dict[str, str]) -> None:
+    try:
+        SESSION_MAP_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"[hub] could not save the session map {SESSION_MAP_FILE}: {e}", flush=True)
 
 
 @dataclass
@@ -105,6 +137,8 @@ class TabConn:
     # human (e.g. a restored work chat) -- never dispatch jobs into it. Tabs on a
     # bare /app become workers; conversations they then create are the bridge's.
     eligible: bool = True
+    # The tab has served a bridge job (sessionStorage), so its conversations are ours.
+    worker: bool = False
 
     async def send(self, msg: dict) -> None:
         await self.ws.send_text(json.dumps(msg))
@@ -127,6 +161,11 @@ class Hub:
         self._key = 0
         # Set whenever a tab frees up / joins / leaves; acquire() waits on it.
         self._changed = asyncio.Event()
+        # Chat sessions: the tab each is pinned to, when each last ran (for LRU
+        # eviction), and its conversation URL (loaded from SESSION_MAP_FILE).
+        self.session_tabs: dict[str, int] = {}
+        self.session_used: dict[str, float] = {}
+        self._session_urls: dict[str, str] | None = None
 
     def online(self) -> bool:
         return bool(self.conns)
@@ -152,98 +191,182 @@ class Hub:
         self._key += 1
         return self._key
 
+    # ---- tab choice ---------------------------------------------------------
+    def _pool(self, authuser: str | None, exclude_key: int | None) -> list[TabConn]:
+        """Eligible tabs (on `authuser`, strictly, if given). Raises when there are none."""
+        pool = [c for c in self.conns.values() if c.eligible and c.key != exclude_key]
+        if not pool and exclude_key is not None:
+            pool = [c for c in self.conns.values() if c.eligible]  # only choice
+        if not pool:
+            raise RuntimeError(
+                "no eligible gemini tab connected -- open a FRESH "
+                "gemini.google.com/app tab (tabs already inside a "
+                "conversation are left alone)"
+            )
+        if authuser is not None:
+            # Strict: quota is per-account, so falling back to another
+            # account's tab would silently burn the wrong quota.
+            pool = [c for c in pool if c.authuser == str(authuser)]
+            if not pool:
+                raise RuntimeError(
+                    f"no eligible gemini tab on account u/{authuser} -- open "
+                    f"gemini.google.com/u/{authuser}/app in the browser"
+                )
+        return pool
+
+    @staticmethod
+    def _best(tabs: list[TabConn]) -> TabConn:
+        # Tabs on a bare /app first (no conversation DOM to drag along), then the
+        # newest connection: freshly (re)loaded tabs are the least likely to be
+        # stale, throttled, or stuck in a bad UI state.
+        bare = [c for c in tabs if not IN_CONVERSATION.search(c.href)]
+        return max(bare or tabs, key=lambda c: c.connected_at)
+
+    async def _wait(self, deadline: float) -> None:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"all {len(self.conns)} gemini tab(s) busy for "
+                f"{ACQUIRE_TIMEOUT:.0f}s -- open more tabs for more parallelism"
+            )
+        self._changed.clear()
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout=min(remaining, 5.0))
+        except asyncio.TimeoutError:
+            pass  # re-check the pool; the deadline check raises eventually
+
     async def acquire(self, authuser: str | None = None,
                       exclude_key: int | None = None) -> TabConn:
         """Reserve a free ELIGIBLE tab (on `authuser` if given, strictly).
+
+        For jobs outside a chat session (media, chats without one). Tabs pinned to
+        a session are taken only when no other tab is free, and lose their pin:
+        the job starts a new conversation there.
 
         Single event loop => no await between picking a tab and marking it busy,
         so two acquirers can never grab the same tab. `exclude_key` skips the tab
         a failed attempt just ran on (retry-elsewhere).
         """
-        if not hasattr(self, "session_tabs"):
-            self.session_tabs: dict[str, int] = {}
-        sess_key = CURRENT_SESSION_KEY.get()
-        if exclude_key is not None and sess_key and self.session_tabs.get(sess_key) == exclude_key:
-            self.session_tabs.pop(sess_key, None)
-
         deadline = time.time() + ACQUIRE_TIMEOUT
         while True:
-            # Limpiar sesiones cuya pestaña se cerró o recargó
-            for sk, tk in list(self.session_tabs.items()):
-                if tk not in self.conns or not self.conns[tk].eligible:
-                    self.session_tabs.pop(sk, None)
-
-            pinned_key = self.session_tabs.get(sess_key) if sess_key else None
-            if pinned_key is None and sess_key:
-                saved_url = _load_session_map().get(sess_key)
-                if saved_url:
-                    match = next((c for c in self.conns.values() if c.eligible and saved_url in c.href), None)
-                    if match:
-                        self.session_tabs[sess_key] = match.key
-                        pinned_key = match.key
-            if pinned_key is not None and pinned_key in self.conns:
-                pinned_conn = self.conns[pinned_key]
-                if not pinned_conn.busy:
-                    pinned_conn.busy = True
-                    return pinned_conn
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    raise RuntimeError(f"pinned tab {pinned_conn.tab_id} busy for {ACQUIRE_TIMEOUT:.0f}s")
-                self._changed.clear()
-                try:
-                    await asyncio.wait_for(self._changed.wait(), timeout=min(remaining, 5.0))
-                except asyncio.TimeoutError:
-                    pass
-                continue
-
-            reserved_keys = set(self.session_tabs.values())
-            pool = [c for c in self.conns.values()
-                    if c.eligible and c.key != exclude_key and c.key not in reserved_keys]
-            if not pool and not sess_key:
-                # Solo compartir pestañas libres para peticiones sin sesión (ej. media o stateless)
-                pool = [c for c in self.conns.values()
-                        if c.eligible and c.key != exclude_key and not c.busy]
-            if not pool and exclude_key is not None:
-                pool = [c for c in self.conns.values() if c.eligible]
-            if not pool:
-                raise RuntimeError(
-                    "no eligible gemini tab connected -- open a FRESH "
-                    "gemini.google.com/app tab (tabs already inside a "
-                    "conversation are left alone)"
-                )
-            if authuser is not None:
-                # Strict: quota is per-account, so falling back to another
-                # account's tab would silently burn the wrong quota.
-                matching = [c for c in pool if c.authuser == str(authuser)]
-                if not matching:
-                    raise RuntimeError(
-                        f"no eligible gemini tab on account u/{authuser} -- open "
-                        f"gemini.google.com/u/{authuser}/app in the browser"
-                    )
-                free = [c for c in matching if not c.busy]
-            else:
-                free = [c for c in pool if not c.busy]
+            self._drop_stale_pins()
+            free = [c for c in self._pool(authuser, exclude_key) if not c.busy]
             if free:
-                # Newest connection first: freshly (re)loaded tabs are the least
-                # likely to be stale, throttled, or stuck in a bad UI state.
-                # Priorizar pestañas que aún están en /app limpio (sin conversación iniciada)
-                fresh_tabs = [c for c in free if "/app/" not in c.href]
-                conn = max(fresh_tabs or free, key=lambda c: c.connected_at)
+                pinned = set(self.session_tabs.values())
+                conn = self._best([c for c in free if c.key not in pinned] or free)
+                self._unpin_tab(conn.key)
                 conn.busy = True
-                if sess_key:
-                    self.session_tabs[sess_key] = conn.key
                 return conn
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise RuntimeError(
-                    f"all {len(self.conns)} gemini tab(s) busy for "
-                    f"{ACQUIRE_TIMEOUT:.0f}s -- open more tabs for more parallelism"
-                )
-            self._changed.clear()
-            try:
-                await asyncio.wait_for(self._changed.wait(), timeout=min(remaining, 5.0))
-            except asyncio.TimeoutError:
-                pass  # re-check the pool; deadline check above raises eventually
+            await self._wait(deadline)
+
+    # ---- chat sessions -------------------------------------------------------
+    def _urls(self) -> dict[str, str]:
+        if self._session_urls is None:
+            self._session_urls = _load_session_map()
+        return self._session_urls
+
+    def _drop_stale_pins(self) -> None:
+        """Unpin sessions whose tab disconnected or is no longer eligible."""
+        for sk, key in list(self.session_tabs.items()):
+            conn = self.conns.get(key)
+            if conn is None or not conn.eligible:
+                del self.session_tabs[sk]
+
+    def _unpin_tab(self, key: int) -> None:
+        for sk, k in list(self.session_tabs.items()):
+            if k == key:
+                del self.session_tabs[sk]
+
+    def _session_tab(self, session: str, authuser: str | None,
+                     exclude_key: int | None) -> TabConn | None:
+        """The tab `session` is pinned to, re-pinning by conversation URL after a
+        reconnect or server restart. None if it has no usable tab."""
+        key = self.session_tabs.get(session)
+        if key is None:
+            url = self._urls().get(session)
+            pinned = set(self.session_tabs.values())
+            match = next((c for c in self.conns.values()
+                          if url and c.href == url and c.eligible
+                          and c.key != exclude_key and c.key not in pinned), None)
+            if match is None:
+                return None
+            self.session_tabs[session] = key = match.key
+        conn = self.conns[key]
+        if key == exclude_key or (authuser is not None and conn.authuser != str(authuser)):
+            del self.session_tabs[session]
+            return None
+        return conn
+
+    def _new_session_tab(self, authuser: str | None,
+                         exclude_key: int | None) -> TabConn | None:
+        """A free tab for a session without one: an unpinned tab if any, else the
+        tab of the least recently used session, which loses its pin."""
+        free = [c for c in self._pool(authuser, exclude_key) if not c.busy]
+        if not free:
+            return None
+        pinned = set(self.session_tabs.values())
+        unpinned = [c for c in free if c.key not in pinned]
+        if unpinned:
+            return self._best(unpinned)
+
+        def last_used(c: TabConn) -> float:
+            return max((self.session_used.get(sk, 0.0)
+                        for sk, k in self.session_tabs.items() if k == c.key), default=0.0)
+
+        conn = min(free, key=last_used)
+        self._unpin_tab(conn.key)
+        return conn
+
+    async def acquire_session(self, session: str, authuser: str | None = None,
+                              exclude_key: int | None = None) -> tuple[TabConn, bool]:
+        """Reserve the tab of chat `session`. Returns (tab, continuing).
+
+        continuing: the tab still shows the session's conversation, so the turn
+        can be sent into it. False for a new pin (a first turn, or a session whose
+        tab was lost or failed): the caller starts a new conversation with the
+        full prompt. A pinned tab that is busy (the session's previous turn still
+        running) is waited for.
+        """
+        deadline = time.time() + ACQUIRE_TIMEOUT
+        if exclude_key is not None and self.session_tabs.get(session) == exclude_key:
+            del self.session_tabs[session]  # retrying elsewhere after a failure
+        while True:
+            self._drop_stale_pins()
+            conn = self._session_tab(session, authuser, exclude_key)
+            if conn is not None:
+                if not conn.busy:
+                    conn.busy = True
+                    self.session_used[session] = time.time()
+                    url = self._urls().get(session)
+                    # No URL yet (the first turn's url_changed hasn't arrived): the
+                    # pin alone says the tab holds it.
+                    return conn, url is None or conn.href == url
+            else:
+                conn = self._new_session_tab(authuser, exclude_key)
+                if conn is not None:
+                    self.session_tabs[session] = conn.key
+                    self.session_used[session] = time.time()
+                    if self._urls().pop(session, None) is not None:
+                        _save_session_map(self._urls())  # its new conversation isn't known yet
+                    conn.busy = True
+                    return conn, False
+            await self._wait(deadline)
+
+    def record_url(self, conn: TabConn) -> None:
+        """Remember the conversation URL of the sessions pinned to `conn`."""
+        if not IN_CONVERSATION.search(conn.href):
+            return
+        urls = self._urls()
+        changed = False
+        for sk, key in self.session_tabs.items():
+            if key == conn.key and urls.get(sk) != conn.href:
+                urls.pop(sk, None)
+                urls[sk] = conn.href  # newest last
+                changed = True
+        if changed:
+            while len(urls) > SESSION_MAP_MAX:
+                urls.pop(next(iter(urls)))
+            _save_session_map(urls)
 
     def release(self, conn: TabConn) -> None:
         conn.busy = False
@@ -308,21 +431,22 @@ class ChromeManager:
         msg = str(exc)
         return any(sig in msg for sig in self.TAB_SHAPED)
 
-    async def generate(self, prompt, files=None, model=None, temporary=False,
+    async def generate(self, prompt, files=None, model=None, temporary=True,
                        authuser: str | None = None, _exclude: int | None = None):
         if files:
             raise RuntimeError("the chrome backend does not support file/vision input yet")
-        conn = await hub.acquire(authuser, exclude_key=_exclude)
+        conn, send_prompt, fresh = await _acquire_chat(prompt, authuser, _exclude)
         rid = hub.next_id()
-        print(f"[hub] chat {rid} -> {conn.tab_id} (u/{conn.authuser})", flush=True)
+        print(f"[hub] chat {rid} -> {conn.tab_id} (u/{conn.authuser}, "
+              f"{'new conversation' if fresh else 'continuing'})", flush=True)
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         hub.pending[rid] = fut
         hub.job_conn[rid] = conn.key
         try:
             await conn.send(
-                {"type": "chat", "id": rid, "prompt": prompt,
-                 "model": _model_name(model), "fresh": bool(temporary)}
+                {"type": "chat", "id": rid, "prompt": send_prompt,
+                 "model": _model_name(model), "fresh": fresh}
             )
             try:
                 msg = await asyncio.wait_for(fut, timeout=REQUEST_TIMEOUT)
@@ -469,19 +593,19 @@ class ChromeManager:
             raise RuntimeError("extension returned no media")
         return media, (msg.get("text", "") if isinstance(msg, dict) else "")
 
-    async def generate_stream(self, prompt, files=None, model=None, temporary=False,
+    async def generate_stream(self, prompt, files=None, model=None, temporary=True,
                               authuser: str | None = None):
         if files:
             raise RuntimeError("the chrome backend does not support file/vision input yet")
-        conn = await hub.acquire(authuser)
+        conn, send_prompt, fresh = await _acquire_chat(prompt, authuser, None)
         rid = hub.next_id()
         q: asyncio.Queue = asyncio.Queue()
         hub.streams[rid] = q
         hub.job_conn[rid] = conn.key
         try:
             await conn.send(
-                {"type": "chat", "id": rid, "prompt": prompt,
-                 "model": _model_name(model), "fresh": bool(temporary)}
+                {"type": "chat", "id": rid, "prompt": send_prompt,
+                 "model": _model_name(model), "fresh": fresh}
             )
             sent = ""
             while True:
@@ -506,6 +630,24 @@ class ChromeManager:
             hub.release(conn)
 
 
+async def _acquire_chat(prompt: str, authuser: str | None,
+                        exclude_key: int | None) -> tuple[TabConn, str, bool]:
+    """A tab for a chat, the prompt to send it and whether to start a new conversation.
+
+    With a session (CURRENT_CHAT) whose tab still holds its conversation, only the
+    continuation goes, into that conversation. Otherwise the full prompt goes into a
+    new conversation (Gemini web keeps it in history either way; `temporary` has no
+    effect on this backend).
+    """
+    chat = CURRENT_CHAT.get()
+    if chat is None:
+        return await hub.acquire(authuser, exclude_key=exclude_key), prompt, True
+    conn, continuing = await hub.acquire_session(chat.key, authuser, exclude_key)
+    if continuing and chat.continuation:
+        return conn, chat.continuation, False
+    return conn, prompt, True
+
+
 def _model_name(model) -> str | None:
     """server.py passes a gemini_webapi Model enum; the extension just needs a
     string hint (or None -- it uses whatever mode the tab has selected)."""
@@ -515,6 +657,13 @@ def _model_name(model) -> str | None:
 
 
 manager = ChromeManager()
+
+
+def _update_eligibility(conn: TabConn) -> None:
+    """Eligible if on a bare /app OR a self-declared worker (its conversation is
+    bridge-made, not the human's). A busy tab keeps its state: its job navigated."""
+    if not conn.busy:
+        conn.eligible = conn.worker or not IN_CONVERSATION.search(conn.href)
 
 
 def register_ws(app: FastAPI) -> None:
@@ -539,15 +688,7 @@ def register_ws(app: FastAPI) -> None:
                 if mtype == "hello":
                     conn.tab_id = str(msg.get("tabId") or conn.tab_id)
                     conn.href = str(msg.get("href") or "")
-                    if "/app/" in conn.href and hasattr(hub, "session_tabs"):
-                        smap = _load_session_map()
-                        changed = False
-                        for sk, tk in hub.session_tabs.items():
-                            if tk == conn.key and smap.get(sk) != conn.href:
-                                smap[sk] = conn.href
-                                changed = True
-                        if changed:
-                            _save_session_map(smap)
+                    conn.worker = bool(msg.get("worker"))
                     au = msg.get("authuser")
                     if au is None:
                         # Older content scripts don't send authuser; the tab URL
@@ -555,29 +696,22 @@ def register_ws(app: FastAPI) -> None:
                         m = re.search(r"/u/(\d+)/", conn.href)
                         au = m.group(1) if m else ("0" if conn.href else None)
                     conn.authuser = str(au) if au is not None else None
-                    if not conn.busy:
-                        # Eligible if on a bare /app OR a self-declared worker
-                        # (its conversation is bridge-made, not the human's).
-                        conn.eligible = bool(msg.get("worker")) or not re.search(
-                            r"/app/[0-9a-f]{6,}", conn.href
-                        )
+                    _update_eligibility(conn)
                     print(f"[hub] hello {conn.tab_id} u/{conn.authuser} "
                           f"eligible={conn.eligible} {conn.href[:60]}", flush=True)
                     continue
                 if mtype == "url_changed":
+                    # Gemini is a SPA: /app -> /app/<id> after a first prompt
+                    # reloads nothing and sends no new hello.
                     conn.href = str(msg.get("href") or conn.href)
-                    if "/app/" in conn.href and hasattr(hub, "session_tabs"):
-                        smap = _load_session_map()
-                        changed = False
-                        for sk, tk in hub.session_tabs.items():
-                            if tk == conn.key and smap.get(sk) != conn.href:
-                                smap[sk] = conn.href
-                                changed = True
-                        if changed:
-                            _save_session_map(smap)
-                    print(f"[hub] url_changed {conn.tab_id} -> {conn.href[:60]}", flush=True)
+                    conn.worker = bool(msg.get("worker", conn.worker))
+                    _update_eligibility(conn)
+                    hub.record_url(conn)
+                    hub.notify_pool_changed()
+                    print(f"[hub] url_changed {conn.tab_id} eligible={conn.eligible} "
+                          f"{conn.href[:60]}", flush=True)
                     continue
-                if mtype == "pong":
+                if mtype in ("pong", "ka"):
                     continue
                 if mtype == "delta" and rid in hub.streams:
                     await hub.streams[rid].put(("delta", msg.get("text", "")))

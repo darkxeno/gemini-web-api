@@ -44,7 +44,13 @@ chrome.runtime.onConnect.addListener((port) => {
       ws.onclose = () => { try { port.postMessage({ t: "close" }); } catch (e) {} };
     } else if (m.t === "send" && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(m.d);
-    } // "ka" (keepalive) needs no handling: receiving it resets the idle timer.
+    } else if (m.t === "ka" && ws && ws.readyState === WebSocket.OPEN) {
+      // Receiving the port message resets the worker's idle timer; forwarding it
+      // keeps the socket itself active too (Chrome counts WebSocket traffic toward
+      // a worker's lifetime, and idle sockets are what proxies drop). The server
+      // ignores it.
+      ws.send('{"type":"ka"}');
+    }
   });
   port.onDisconnect.addListener(() => { try { if (ws) ws.close(); } catch (e) {} });
 });

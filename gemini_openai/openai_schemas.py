@@ -1,14 +1,10 @@
-from __future__ import annotations
-
-import hashlib
-from contextvars import ContextVar
-CURRENT_SESSION_KEY: ContextVar[str | None] = ContextVar('CURRENT_SESSION_KEY', default=None)
-
 """OpenAI-compatible request/response schemas and message conversion helpers."""
 
+from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import time
 import uuid
@@ -93,13 +89,8 @@ def _compact_system(txt: str) -> str:
         return (head[:1200] + "\n\n" + txt[idx:]) if len(head) > 1200 else txt
     return txt[:2000]
 
-def flatten_messages(messages: list[ChatMessage]) -> tuple[str, list[bytes]]:
-    """Collapse an OpenAI message list into (prompt, image_files).
-
-    OpenAI clients send the full conversation each call, so we render a plain
-    transcript. A single user turn is sent as-is; multi-turn history is labeled.
-    Image parts are extracted as bytes to pass to gemini_webapi's `files=`.
-    """
+def _render_turns(messages: list[ChatMessage]) -> tuple[list[tuple[str, str]], list[bytes]]:
+    """Each message as (role, text), tool calls and results rendered inline, plus image bytes."""
     files: list[bytes] = []
     turns: list[tuple[str, str]] = []  # (role, text)
 
@@ -138,18 +129,47 @@ def flatten_messages(messages: list[ChatMessage]) -> tuple[str, list[bytes]]:
             text = f"Tool Result ({name}):\n{text}"
 
         turns.append((m.role, text))
+    return turns, files
 
+
+def session_key(messages: list[ChatMessage]) -> str:
+    """A stable id for the conversation these messages belong to.
+
+    OpenAI clients resend the whole history every call and carry no conversation
+    id, so the key is the system prompt's start plus the first user message: the
+    same on every turn of one conversation. Two conversations that open with the
+    same system prompt AND the same first message share a key.
+    """
+    turns, _ = _render_turns(messages)
+    system = "\n\n".join(t for r, t in turns if r == "system" and t.strip())
+    first_user = next((t for r, t in turns if r == "user"), "")
+    return hashlib.sha256(f"{system[:500]}|{first_user}".encode()).hexdigest()[:16]
+
+
+def continuation(messages: list[ChatMessage]) -> str | None:
+    """What is new since the model's last reply, for a tab that already holds the conversation.
+
+    Every message after the last assistant one: the user's next message, or ALL
+    the tool results of a parallel tool call, not just the last. None when the
+    model hasn't replied yet (the first turn), which needs the full prompt.
+    """
+    turns, _ = _render_turns(messages)
+    last_assistant = max((i for i, (r, _) in enumerate(turns) if r == "assistant"), default=None)
+    if last_assistant is None:
+        return None
+    new = [t.strip() for r, t in turns[last_assistant + 1:] if r != "system" and t.strip()]
+    return "\n\n".join(new) or None
+
+
+def flatten_messages(messages: list[ChatMessage]) -> tuple[str, list[bytes]]:
+    """Collapse an OpenAI message list into (prompt, image_files).
+
+    OpenAI clients send the full conversation each call, so we render a plain
+    transcript. A single user turn is sent as-is; multi-turn history is labeled.
+    Image parts are extracted as bytes to pass to gemini_webapi's `files=`.
+    """
+    turns, files = _render_turns(messages)
     non_empty = [(r, t) for r, t in turns if t.strip() or r == "user"]
-    sys_seed = "\n\n".join(t for r, t in non_empty if r == "system")
-    first_usr = next((t for r, t in non_empty if r == "user"), "")
-    s_hash = hashlib.sha256(f"{sys_seed[:500]}|{first_usr}".encode("utf-8")).hexdigest()[:16]
-    CURRENT_SESSION_KEY.set(s_hash)
-
-    # Incremental path: if conversation already has assistant/tool turns, send ONLY the latest turn
-    non_sys = [t for t in non_empty if t[0] != "system"]
-    if len(non_sys) > 1:
-        last_role, last_txt = non_sys[-1]
-        return last_txt.strip(), files
 
     # Fast path: a single user message (optionally with a system message).
     if len([t for t in non_empty if t[0] not in ("system",)]) == 1:

@@ -25,7 +25,9 @@ from .openai_schemas import (
     ChatCompletionRequest,
     chunk,
     completion_response,
+    continuation,
     flatten_messages,
+    session_key,
     _rid,
 )
 
@@ -42,7 +44,13 @@ from .openai_schemas import (
 # connected tab only fetches the finished bytes (fetch_media_bytes), because
 # Google 403s server-side downloads and the tab's own DOM-driven generation
 # stalls in a background tab.
-from .chrome_backend import hub as _chrome_hub, manager as chrome_manager, register_ws
+from .chrome_backend import (
+    CURRENT_CHAT,
+    ChatSession,
+    hub as _chrome_hub,
+    manager as chrome_manager,
+    register_ws,
+)
 from .gemini_pool import manager as webapi_manager
 
 
@@ -238,20 +246,18 @@ async def list_models(_=Depends(check_key)) -> dict:
 
 @app.get("/health")
 async def health() -> dict:
-    tabs = _chrome_hub.tabs()
-    reserved = set(getattr(_chrome_hub, "session_tabs", {}).values())
-    eligible_tabs = [t for t in tabs if t.get("eligible")]
-    free_tabs = [
-        c for c in _chrome_hub.conns.values()
-        if c.eligible and not c.busy and c.key not in reserved
-    ]
+    # free_tabs: eligible, idle and pinned to no chat session, so a new session
+    # (or a media job) gets one without taking over another session's tab.
+    pinned = set(_chrome_hub.session_tabs.values())
+    eligible = [c for c in _chrome_hub.conns.values() if c.eligible]
+    free = [c for c in eligible if not c.busy and c.key not in pinned]
     return {
         "status": "ok",
         "backend_mode": config.BACKEND,          # auto | webapi | chrome
         "active_backend": active_backend_name(),  # which one handles chat right now
         "extension_connected": _chrome_hub.online(),
-        "eligible_tabs": len(eligible_tabs),
-        "free_tabs": len(free_tabs),
+        "eligible_tabs": len(eligible),
+        "free_tabs": len(free),
     }
 
 
@@ -321,6 +327,23 @@ async def extension_reload(_=Depends(check_key)) -> dict:
 # --------------------------------------------------------------------------- #
 # Chat completions
 # --------------------------------------------------------------------------- #
+def _with_tools(req: ChatCompletionRequest, prompt: str) -> str:
+    """The prompt with the tool schemas in front, when the request carries tools."""
+    if req.tools and req.tool_choice != "none":
+        return tools_mod.build_tools_prompt(req.tools, req.tool_choice) + "\n\n" + prompt
+    return prompt
+
+
+def _chat_session(req: ChatCompletionRequest) -> ChatSession:
+    """The conversation this request continues, for the chrome backend's tab pinning.
+
+    Its continuation keeps the tool schemas in front, as every full prompt has them.
+    """
+    cont = continuation(req.messages)
+    return ChatSession(key=session_key(req.messages),
+                       continuation=_with_tools(req, cont) if cont else None)
+
+
 async def _run_generation(req: ChatCompletionRequest):
     """Run one turn. Returns (content_text, tool_calls|None, prompt).
 
@@ -333,14 +356,14 @@ async def _run_generation(req: ChatCompletionRequest):
     if not prompt.strip() and not files:
         raise HTTPException(status_code=400, detail="empty prompt")
 
-    if req.tools and req.tool_choice != "none":
-        prompt = tools_mod.build_tools_prompt(req.tools, req.tool_choice) + "\n\n" + prompt
+    prompt = _with_tools(req, prompt)
+    CURRENT_CHAT.set(_chat_session(req))
 
     output = await pick_manager(has_files=bool(files)).generate(
         prompt,
         files=files or None,
         model=model,
-        temporary=False,  # keep the user's Gemini history clean
+        temporary=True,  # keep the user's Gemini history clean
     )
     text = render_output(output)
 
@@ -412,9 +435,10 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
             return
 
         final_output = None
+        CURRENT_CHAT.set(_chat_session(req))
         try:
             async for out in pick_manager(has_files=bool(files)).generate_stream(
-                prompt, files=files or None, model=model, temporary=False
+                prompt, files=files or None, model=model, temporary=True
             ):
                 final_output = out
                 delta = out.text_delta or ""
@@ -507,7 +531,7 @@ async def images_generations(body: dict, request: Request, _=Depends(check_key))
         if prof != str(config.AUTHUSER or "0"):
             await video_mod._switch_profile(manager, prof)
         tried.append(prof)
-        output = await manager.generate(instruction, model=model, temporary=False)
+        output = await manager.generate(instruction, model=model, temporary=True)
         data = [
             {"url": await _local_url(img.url, request), "revised_prompt": getattr(img, "title", None)}
             for img in (getattr(output, "images", []) or [])

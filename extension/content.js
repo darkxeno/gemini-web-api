@@ -202,17 +202,24 @@
     }
   }
 
-  function setPrompt(el, text) {
-    el.focus();
-    // clear existing content, then insert -- execCommand triggers the editor's
-    // own input handling (Gemini uses a Quill-like rich editor).
+  function clearComposer(el) {
     const sel = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(el);
     sel.removeAllRanges();
     sel.addRange(range);
     document.execCommand("delete", false);
-    // insertText keeps newlines; do it in one shot.
+  }
+
+  // Characters that survive the editor's whitespace handling (newlines become paragraphs).
+  const solidLength = (t) => (t || "").replace(/\s+/g, "").length;
+
+  function setPrompt(el, text) {
+    el.focus();
+    // clear existing content, then insert -- execCommand triggers the editor's
+    // own input handling (Gemini uses a Quill-like rich editor).
+    clearComposer(el);
+    // Pasted in chunks: one huge insertText stalls the editor on long prompts.
     let ok = false;
     try {
       const CHUNK = 8000;
@@ -226,9 +233,11 @@
           cancelable: true
         }));
       }
-      ok = (el.textContent || "").trim().length >= Math.min(text.trim().length, 20);
+      // All of it, not just a start: a partial paste would send a truncated prompt.
+      ok = solidLength(el.textContent) >= solidLength(text);
     } catch (_) {}
     if (!ok) {
+      clearComposer(el); // drop a partial paste, or the fallback would duplicate it
       ok = document.execCommand("insertText", false, text);
     }
     if (!ok) {
@@ -249,8 +258,11 @@
     // 2) poll the last node until the text is stable. The stop button is only a
     // hint: since the 2026-07 UI update a visible "Stop response" button can
     // PERSIST after generation ends, so requiring it to vanish stalls every
-    // chat to the hard timeout. Text stability alone finishes the job:
-    // ~1.6s stable + no stop button, or ~4s stable regardless of the button.
+    // chat to the hard timeout. net_hook.js's stream state finishes it as soon as
+    // Gemini's response stream ends. Without that signal, text stability does:
+    // ~1.2s stable + no stop button, or ~4s stable regardless of the button. While
+    // the stream is open, only 30s of unchanged text ends it (a thinking pause can
+    // run long; a stream counter that never comes back down must not hang the job).
     let last = "";
     let stable = 0;
     let streamActive = false;
@@ -283,11 +295,12 @@
           return (finalNode ? (finalNode.innerText || "").trim() : "") || text;
         }
 
-        if (!streamActive && !streamCompleted) {
-          const generating = !!findStopButton();
-          if (text && text === last) stable += 1;
-          else stable = 0;
-          if (text && stable >= 8 && !generating) return text;
+        if (text && text === last) stable += 1;
+        else stable = 0;
+        if (text && streamActive && stable >= 200) return text;
+        if (text && !streamActive) {
+          if (stable >= 8 && !findStopButton()) return text;
+          if (stable >= 27) return text;
         }
 
         last = text;
@@ -580,29 +593,19 @@
     return s;
   }
 
-  // Track SPA URL changes (/app -> /app/<id>) so the server updates its session map
+  // Gemini is a SPA: its first prompt moves /app -> /app/<id> with no reload and
+  // no new hello. Report every URL change, so the server can pin the conversation
+  // to its session and re-judge whether the tab is the human's. Polled: this
+  // isolated world can't hook the page's own history.pushState calls.
   let lastReportedHref = location.href;
   function reportUrlChange() {
-    if (shuttingDown) return;
-    if (location.href !== lastReportedHref) {
+    if (shuttingDown || location.href === lastReportedHref) return;
+    if (sendMsg({ type: "url_changed", tabId: TAB_ID, href: location.href, worker: servedJob })) {
       lastReportedHref = location.href;
-      sendMsg({ type: "url_changed", tabId: TAB_ID, href: location.href });
     }
   }
-  const origPushState = history.pushState;
-  history.pushState = function (...args) {
-    const ret = origPushState.apply(this, args);
-    reportUrlChange();
-    return ret;
-  };
-  const origReplaceState = history.replaceState;
-  history.replaceState = function (...args) {
-    const ret = origReplaceState.apply(this, args);
-    reportUrlChange();
-    return ret;
-  };
   window.addEventListener("popstate", reportUrlChange);
-  setInterval(reportUrlChange, 1500);
+  setInterval(reportUrlChange, 1000);
 
   function connect() {
     const wsUrl = `ws://localhost:${PORT}/ws`;
