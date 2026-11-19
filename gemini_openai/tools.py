@@ -88,6 +88,7 @@ else before or after it:
 Rules:
 - `arguments` must be a JSON object matching that tool's parameter schema.
 - You may return multiple tool calls in the `tool_calls` array (they run together).
+- Do NOT ask the user for confirmation ("ok", "continue", "next turn") and do NOT stop to explain what you will do next — emit the ```json block immediately.
 - If you do NOT need a tool, reply normally in plain text with no json block.
 - ⛔ NEVER put multi-line code or file contents directly inside the JSON —
   it breaks the JSON. Instead put the code in a SEPARATE fenced code block
@@ -300,6 +301,22 @@ def to_openai_tool_calls(parsed: list[dict[str, Any]]) -> list[dict[str, Any]]:
             },
         })
     return out
+
+
+def parse_continue(response: str) -> bool:
+    """True when the model emitted a JSON block with `"continue": true` and no tool calls."""
+    cleaned = response.replace("\_", "_")
+    for m in _FENCE_RE.finditer(cleaned):
+        body = m.group(1).strip()
+        if '"continue"' not in body:
+            continue
+        try:
+            obj = _loads(body)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(obj, dict) and obj.get("continue") is True:
+            return True
+    return False
 
 
 def strip_tool_json(text: str) -> str:

@@ -253,6 +253,34 @@ async def _account_quota() -> dict:
     return out
 
 
+_AUTO_CONTINUE_NEEDLES = (
+    "en el siguiente turno",
+    "en el siguiente paso",
+    "responde \"ok\"",
+    "responde 'ok'",
+    "responde con \"ok\"",
+    "responde con 'ok'",
+    "dime \"ok\"",
+    "dime 'ok'",
+    "0 remaining",
+    "presupuesto de llamadas",
+    "in the next turn",
+    "reply \"ok\"",
+    "reply 'ok'",
+)
+
+
+def _should_auto_continue(text: str | None) -> bool:
+    if not text:
+        return False
+    if tools_mod.parse_continue(text):
+        return True
+    if len(text) > 900:
+        return False
+    low = text.lower()
+    return any(n in low for n in _AUTO_CONTINUE_NEEDLES)
+
+
 def _est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
@@ -527,6 +555,25 @@ async def _run_generation(req: ChatCompletionRequest):
             output = await mgr.generate(
                 prompt,
                 files=files or None,
+                model=model,
+                temporary=True,
+            )
+            text = render_output(output)
+            refusal = metrics.classify_refusal(text)
+            metrics.note(response_chars=len(text or ""), refusal=refusal)
+            t0 = time.monotonic()
+            parsed = tools_mod.parse_tool_calls(text)
+            metrics.note(parse_s=round(time.monotonic() - t0, 3))
+        max_cont = max(0, int(os.getenv("GEMINI_AUTO_CONTINUE_MAX", "2")))
+        for _ in range(max_cont):
+            if parsed or not _should_auto_continue(text):
+                break
+            cont_prompt = (
+                "Proceed now and emit ONLY the fenced ```json {\"tool_calls\": [...]} block for the next action."
+            )
+            output = await mgr.generate(
+                cont_prompt,
+                files=None,
                 model=model,
                 temporary=True,
             )
