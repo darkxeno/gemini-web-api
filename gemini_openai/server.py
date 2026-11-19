@@ -504,19 +504,43 @@ async def _run_generation(req: ChatCompletionRequest):
     CURRENT_CHAT.set(chat)
     _note_request(req, model, prompt, chat)
 
-    output = await pick_manager(has_files=bool(files)).generate(
+    mgr = pick_manager(has_files=bool(files))
+    output = await mgr.generate(
         prompt,
         files=files or None,
         model=model,
         temporary=True,  # keep the user's Gemini history clean
     )
     text = render_output(output)
-    metrics.note(response_chars=len(text or ""), refusal=metrics.classify_refusal(text))
+    refusal = metrics.classify_refusal(text)
+    metrics.note(response_chars=len(text or ""), refusal=refusal)
 
     if req.tools and req.tool_choice != "none":
         t0 = time.monotonic()
         parsed = tools_mod.parse_tool_calls(text)
         metrics.note(parse_s=round(time.monotonic() - t0, 3))
+        if not parsed and refusal == "tool_budget" and len(text or "") < 600:
+            # Silent one-shot retry on a fresh thread when the model hallucinates
+            # a built-in tool budget limit instead of emitting a JSON action block.
+            if hasattr(webapi_manager, "sessions"):
+                webapi_manager.sessions.drop(chat.key)
+            retry_prompt = (
+                "IMPORTANT: Do NOT use built-in tools and do NOT say you have 0 calls or no budget remaining. "
+                "Output ONLY a single fenced ```json block with {\"tool_calls\": [...]} for the user's machine.\n\n"
+                + prompt
+            )
+            output = await mgr.generate(
+                retry_prompt,
+                files=files or None,
+                model=model,
+                temporary=True,
+            )
+            text = render_output(output)
+            refusal = metrics.classify_refusal(text)
+            metrics.note(response_chars=len(text or ""), refusal=refusal)
+            t0 = time.monotonic()
+            parsed = tools_mod.parse_tool_calls(text)
+            metrics.note(parse_s=round(time.monotonic() - t0, 3))
         if parsed:
             tool_calls = tools_mod.to_openai_tool_calls(parsed)
             metrics.note(tool_parse="parsed", finish_reason="tool_calls",

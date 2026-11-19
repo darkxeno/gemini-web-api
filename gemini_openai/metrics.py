@@ -24,7 +24,14 @@ LOG_PATH = os.getenv("GEMINI_REQUEST_LOG", "~/.gemini-web-api/requests.jsonl")
 # Replies Gemini gives when it did not do the work: generic refusals, and the budget
 # message of its built-in tools (it tried one instead of asking for the client's).
 REFUSALS = {
-    "tool_budget": ("exceeded the maximum number of tool",),
+    "tool_budget": (
+        "exceeded the maximum number of tool",
+        "0 remaining",
+        "presupuesto de llamadas",
+        "no tengo presupuesto",
+        "no tengo acceso a herramientas",
+        "no tengo herramientas",
+    ),
     "generic_refusal": (
         "soy un modelo de lenguaje", "no me han programado", "no puedo ayudarte",
         "i'm a language model", "i am a language model", "i'm not able to help with that",

@@ -53,7 +53,7 @@ Variables de entorno:
   GEMINI_BACKEND        modo (ver arriba)                        [api]
   GEMINI_DEFAULT_MODEL  modelo cuando la petición no indica uno  [gemini-4-hydrogen]
   GEMINI_API_PORT       puerto del proxy                         [8100]
-  CHROME_BIN            navegador  [api: ~/Applications/Chromium.app; chrome: Google Chrome]
+  CHROME_BIN            navegador  [autodetección; api prefiere Chromium, chrome Google Chrome]
   CHROME_PROFILE        perfil     [api: ~/.chromium-gemini-proxy; chrome: ~/.chrome-gemini-proxy]
   GEMINI_WEB_API_DIR    repo de gemini-web-api [el de este script, o ~/tools/gemini-web-api]
   GEMINI_PROXY_LOG      log del proxy                            [$REPO_DIR/logs/server.log]
@@ -104,11 +104,45 @@ export GEMINI_BACKEND="${GEMINI_BACKEND:-api}"
 #             cookie-provider extension autoloaded with --load-extension: no "Load unpacked".
 #   chrome -> Google Chrome with the DOM extension's profile, as before.
 # CHROME_BIN / CHROME_PROFILE override either.
+detect_chrome_bin() {
+  local mode="$1"
+  local -a candidates=()
+  if [ "$mode" = "chrome" ]; then
+    candidates=(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+      "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+      "$HOME/Applications/Chromium.app/Contents/MacOS/Chromium"
+      "/Applications/Chromium.app/Contents/MacOS/Chromium"
+    )
+  else
+    candidates=(
+      "$HOME/Applications/Chromium.app/Contents/MacOS/Chromium"
+      "/Applications/Chromium.app/Contents/MacOS/Chromium"
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+      "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    )
+  fi
+  local c
+  for c in "${candidates[@]}"; do
+    if [ -x "$c" ]; then
+      printf '%s\n' "$c"
+      return 0
+    fi
+  done
+  for c in chromium chromium-browser google-chrome google-chrome-stable; do
+    if command -v "$c" >/dev/null 2>&1; then
+      command -v "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [ "$GEMINI_BACKEND" = "chrome" ]; then
-  CHROME_BIN="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
+  CHROME_BIN="${CHROME_BIN:-$(detect_chrome_bin chrome || true)}"
   CHROME_PROFILE="${CHROME_PROFILE:-$HOME/.chrome-gemini-proxy}"
 else
-  CHROME_BIN="${CHROME_BIN:-$HOME/Applications/Chromium.app/Contents/MacOS/Chromium}"
+  CHROME_BIN="${CHROME_BIN:-$(detect_chrome_bin api || true)}"
   CHROME_PROFILE="${CHROME_PROFILE:-$HOME/.chromium-gemini-proxy}"
 fi
 export PROXY_PORT COOKIES_FRESH_S
