@@ -571,12 +571,30 @@ async def _run_generation(req: ChatCompletionRequest):
             cont_prompt = (
                 "Proceed now and emit ONLY the fenced ```json {\"tool_calls\": [...]} block for the next action."
             )
-            output = await mgr.generate(
-                cont_prompt,
-                files=None,
-                model=model,
-                temporary=True,
+            # Continue the same thread with cont_prompt without tripping thread_for()
+            # (req.messages hasn't grown yet) and fall back to full prompt + cont_prompt,
+            # never cont_prompt alone on a brand-new thread.
+            cont_messages = tuple(req.messages) + (
+                ChatMessage(role="assistant", content=text),
+                ChatMessage(role="user", content=cont_prompt),
             )
+            cont_chat = ChatSession(
+                key=chat.key,
+                continuation=cont_prompt,
+                messages=cont_messages,
+                continuation_brief=cont_prompt,
+                tools_digest=chat.tools_digest,
+            )
+            CURRENT_CHAT.set(cont_chat)
+            try:
+                output = await mgr.generate(
+                    prompt + "\n\n" + cont_prompt,
+                    files=None,
+                    model=model,
+                    temporary=True,
+                )
+            finally:
+                CURRENT_CHAT.set(chat)
             text = render_output(output)
             refusal = metrics.classify_refusal(text)
             metrics.note(response_chars=len(text or ""), refusal=refusal)

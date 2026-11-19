@@ -36,7 +36,7 @@ _RETRYABLE = (AuthError, APIError)
 # into the 300s watchdog/recovery loop) and max retries on the SAME thread.
 _CONTINUE_TIMEOUT_S = float(config.os.getenv("GEMINI_CONTINUE_TIMEOUT_S", "75"))
 _CONTINUE_ATTEMPTS = max(1, int(config.os.getenv("GEMINI_CONTINUE_ATTEMPTS", "3")))
-_THREAD_TRANSIENT = (asyncio.TimeoutError, TimeoutError, OSError)
+_THREAD_TRANSIENT = (asyncio.TimeoutError, TimeoutError, OSError, APIError, RuntimeError)
 
 
 def _for_account(client: GeminiClient, kwargs: dict) -> dict:
@@ -298,6 +298,8 @@ class GeminiManager:
                             break
                         if attempt < _CONTINUE_ATTEMPTS:
                             self._count_retry()
+                            if isinstance(e, APIError):
+                                await self.reset()
                             print(f"[api] session {chat.key[:8]}: continue attempt {attempt}/{_CONTINUE_ATTEMPTS} "
                                   f"timed out/failed ({type(e).__name__}: {e}); retrying same thread", flush=True)
                 metrics.note(thread="continue_failed", thread_error=f"{type(last_err).__name__}: {str(last_err)[:160]}")
@@ -355,10 +357,11 @@ class GeminiManager:
                         self.sessions.save(chat, gchat.metadata, self._account)
                         return
                     except StopAsyncIteration:
-                        metrics.note(gemini_s=round(time.monotonic() - t0, 2))
-                        self._log_turn(chat, "continued its thread", kwargs, started, sent)
-                        self.sessions.save(chat, gchat.metadata, self._account)
-                        return
+                        last_err = RuntimeError("empty stream before first chunk")
+                        if attempt < _CONTINUE_ATTEMPTS:
+                            self._count_retry()
+                            print(f"[api] session {chat.key[:8]}: continue attempt {attempt}/{_CONTINUE_ATTEMPTS} "
+                                  f"returned empty stream; retrying same thread", flush=True)
                     except Exception as e:  # noqa: BLE001
                         last_err = e
                         if yielded:
@@ -369,6 +372,8 @@ class GeminiManager:
                             break
                         if attempt < _CONTINUE_ATTEMPTS:
                             self._count_retry()
+                            if isinstance(e, APIError):
+                                await self.reset()
                             print(f"[api] session {chat.key[:8]}: continue attempt {attempt}/{_CONTINUE_ATTEMPTS} "
                                   f"timed out/failed ({type(e).__name__}: {e}); retrying same thread", flush=True)
                     finally:
