@@ -36,7 +36,7 @@ _RETRYABLE = (AuthError, APIError)
 # into the 300s watchdog/recovery loop) and max retries on the SAME thread.
 _CONTINUE_TIMEOUT_S = float(config.os.getenv("GEMINI_CONTINUE_TIMEOUT_S", "75"))
 _CONTINUE_ATTEMPTS = max(1, int(config.os.getenv("GEMINI_CONTINUE_ATTEMPTS", "3")))
-_THREAD_TRANSIENT = (asyncio.TimeoutError, TimeoutError, OSError, APIError, RuntimeError)
+_THREAD_TRANSIENT = (asyncio.TimeoutError, TimeoutError, OSError, RuntimeError)
 
 
 def _for_account(client: GeminiClient, kwargs: dict) -> dict:

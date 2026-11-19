@@ -301,9 +301,62 @@ def _media_markdown(output) -> str:
     return "\n\n".join(parts).strip()
 
 
+import html as _html
+import re as _re
+
+_ATTR_RE = _re.compile(r'(\w+)="((?:\\.|[^"])*)"')
+_ELICITATION_RE = _re.compile(r'<Elicitation\b([^>]*)/?>', _re.DOTALL)
+_GROUP_RE = _re.compile(r'<ElicitationsGroup\b([^>]*)>(.*?)</ElicitationsGroup>', _re.DOTALL)
+_FOLLOWUP_RE = _re.compile(r'<FollowUp\b([^>]*)/?>', _re.DOTALL)
+
+
+def _attrs(raw: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for m in _ATTR_RE.finditer(raw or ""):
+        out[m.group(1)] = _html.unescape(m.group(2).replace('\\"', '"'))
+    return out
+
+
+def _render_lmdx(text: str) -> str:
+    """Convert Gemini internal LMDX UI tags into readable Markdown suggestions."""
+    if "<ElicitationsGroup" not in text and "<FollowUp" not in text and "<Elicitation" not in text:
+        return text
+
+    def repl_group(m: _re.Match) -> str:
+        g_attrs = _attrs(m.group(1))
+        msg = g_attrs.get("message", "").strip()
+        items: list[str] = []
+        for idx, em in enumerate(_ELICITATION_RE.finditer(m.group(2)), 1):
+            a = _attrs(em.group(1))
+            label = a.get("label", "").strip()
+            query = a.get("query", "").strip()
+            if label and query and label.lower() != query.lower():
+                items.append(f"{idx}. **{label}** — `{query}`")
+            elif label or query:
+                items.append(f"{idx}. **{label or query}**")
+        if not items:
+            return ""
+        header = f"**{msg}**\n" if msg else ""
+        return "\n" + header + "\n".join(items) + "\n"
+
+    def repl_followup(m: _re.Match) -> str:
+        a = _attrs(m.group(1))
+        label = a.get("label", "").strip()
+        query = a.get("query", "").strip()
+        if label and query and label.lower() != query.lower():
+            return f"\n> **Siguiente paso sugerido:** {label} (`{query}`)\n"
+        if label or query:
+            return f"\n> **Siguiente paso sugerido:** {label or query}\n"
+        return ""
+
+    out = _GROUP_RE.sub(repl_group, text)
+    out = _FOLLOWUP_RE.sub(repl_followup, out)
+    return out.strip()
+
+
 def render_output(output) -> str:
     """ModelOutput -> markdown text including any generated media URLs."""
-    text = (output.text or "").strip()
+    text = _render_lmdx((output.text or "").strip())
     media = _media_markdown(output)
     return "\n\n".join(p for p in (text, media) if p).strip()
 
