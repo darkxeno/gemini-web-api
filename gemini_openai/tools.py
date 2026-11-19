@@ -89,7 +89,7 @@ Rules:
 - `arguments` must be a JSON object matching that tool's parameter schema.
 - You may return multiple tool calls in the `tool_calls` array (they run together).
 - Do NOT ask the user for confirmation ("ok", "continue", "next turn") and do NOT stop to explain what you will do next — emit the ```json block immediately.
-- If you do NOT need a tool, reply normally in plain text with no json block.
+- If you do NOT need a tool, reply in standard Markdown with no json block and no custom XML/UI tags (<ElicitationsGroup>, <FollowUp>, <Steps>, etc.).
 - ⛔ NEVER put multi-line code or file contents directly inside the JSON —
   it breaks the JSON. Instead put the code in a SEPARATE fenced code block
   ABOVE the json block, and reference it with a placeholder string:
@@ -143,7 +143,8 @@ def build_tools_reminder(tools: list[dict[str, Any]], tool_choice: Any = None) -
 You can still request actions from the user's machine exactly as explained at the
 start of this conversation: a SINGLE fenced ```json block with {{"tool_calls": [...]}}
 and nothing else, code in separate blocks with the same placeholders. Still no
-built-in tools of your own. Available actions: {names}.{_forced(tool_choice)}
+built-in tools of your own; use standard Markdown without custom XML/UI tags in text replies.
+Available actions: {names}.{_forced(tool_choice)}
 """
     return f"""# TOOLS (reminder)
 

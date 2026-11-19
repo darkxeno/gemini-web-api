@@ -308,6 +308,8 @@ _ATTR_RE = _re.compile(r'(\w+)="((?:\\.|[^"])*)"')
 _ELICITATION_RE = _re.compile(r'<Elicitation\b([^>]*)/?>', _re.DOTALL)
 _GROUP_RE = _re.compile(r'<ElicitationsGroup\b([^>]*)>(.*?)</ElicitationsGroup>', _re.DOTALL)
 _FOLLOWUP_RE = _re.compile(r'<FollowUp\b([^>]*)/?>', _re.DOTALL)
+_STEP_RE = _re.compile(r'<Step\b([^>]*)>(.*?)</Step>', _re.DOTALL)
+_STEPS_CONTAINER_RE = _re.compile(r'<(?:Steps|Sequence)\b[^>]*>(.*?)</(?:Steps|Sequence)>', _re.DOTALL)
 
 
 def _attrs(raw: str) -> dict[str, str]:
@@ -319,7 +321,7 @@ def _attrs(raw: str) -> dict[str, str]:
 
 def _render_lmdx(text: str) -> str:
     """Convert Gemini internal LMDX UI tags into readable Markdown suggestions."""
-    if "<ElicitationsGroup" not in text and "<FollowUp" not in text and "<Elicitation" not in text:
+    if not any(tag in text for tag in ("<ElicitationsGroup", "<FollowUp", "<Elicitation", "<Steps", "<Sequence", "<Step")):
         return text
 
     def repl_group(m: _re.Match) -> str:
@@ -349,7 +351,21 @@ def _render_lmdx(text: str) -> str:
             return f"\n> **Siguiente paso sugerido:** {label or query}\n"
         return ""
 
-    out = _GROUP_RE.sub(repl_group, text)
+    def repl_steps(m: _re.Match) -> str:
+        parts: list[str] = []
+        for idx, sm in enumerate(_STEP_RE.finditer(m.group(1)), 1):
+            a = _attrs(sm.group(1))
+            title = a.get("title", "").strip()
+            subtitle = a.get("subtitle", "").strip()
+            body = sm.group(2).strip()
+            heading = f"{idx}. **{title}**" if title else f"{idx}."
+            if subtitle:
+                heading += f" — *{subtitle}*"
+            parts.append(f"{heading}\n{body}".strip() if body else heading)
+        return "\n" + "\n\n".join(parts) + "\n" if parts else ""
+
+    out = _STEPS_CONTAINER_RE.sub(repl_steps, text)
+    out = _GROUP_RE.sub(repl_group, out)
     out = _FOLLOWUP_RE.sub(repl_followup, out)
     return out.strip()
 

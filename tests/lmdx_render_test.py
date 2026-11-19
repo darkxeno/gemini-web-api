@@ -23,6 +23,24 @@ def test_render_lmdx_elicitations_group_and_followup():
     assert "**Siguiente paso sugerido:** Ver logs (`Inspect logs/server.log`)" in rendered
 
 
+def test_render_lmdx_steps():
+    raw = (
+        '<Steps>\n'
+        '  <Step title="Comprobar .tpk" subtitle="En native-service/">\n'
+        '    Busca archivos `*.tpk`.\n'
+        '  </Step>\n'
+        '  <Step title="Alinear versión">\n'
+        '    Revisa `package.json`.\n'
+        '  </Step>\n'
+        '</Steps>'
+    )
+    rendered = server._render_lmdx(raw)
+    assert "<Steps>" not in rendered and "<Step" not in rendered
+    assert "1. **Comprobar .tpk** — *En native-service/*" in rendered
+    assert "Busca archivos `*.tpk`." in rendered
+    assert "2. **Alinear versión**" in rendered
+
+
 def test_render_output_converts_lmdx_blocks():
     out = SimpleNamespace(
         text='<FollowUp label="Continuar" query="Run next step" />',
