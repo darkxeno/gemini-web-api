@@ -32,6 +32,12 @@ from .sessions import CURRENT_CHAT, ApiSessionStore, ChatSession
 # build label / session — a fresh client clears them.
 _RETRYABLE = (AuthError, APIError)
 
+# Timeout per attempt when continuing an existing Gemini thread (before falling
+# into the 300s watchdog/recovery loop) and max retries on the SAME thread.
+_CONTINUE_TIMEOUT_S = float(config.os.getenv("GEMINI_CONTINUE_TIMEOUT_S", "75"))
+_CONTINUE_ATTEMPTS = max(1, int(config.os.getenv("GEMINI_CONTINUE_ATTEMPTS", "3")))
+_THREAD_TRANSIENT = (asyncio.TimeoutError, TimeoutError, OSError)
+
 
 def _for_account(client: GeminiClient, kwargs: dict) -> dict:
     """Resolve a model NAME against the models this account actually offers.
@@ -271,21 +277,33 @@ class GeminiManager:
             client = await self._timed_get()
             thread = self.sessions.thread_for(chat, self._account)
             if thread is not None:
-                gchat = client.start_chat(metadata=thread)
                 sent = self._continuation(chat)
-                try:
-                    t0 = time.monotonic()
-                    out = await client.generate_content(
-                        sent, chat=gchat, **_for_account(client, kwargs))
-                    metrics.note(gemini_s=round(time.monotonic() - t0, 2))
-                    self._log_turn(chat, "continued its thread", kwargs, started, sent)
-                    self.sessions.save(chat, gchat.metadata, self._account)
-                    return out
-                except Exception as e:  # noqa: BLE001
-                    metrics.note(thread="continue_failed", thread_error=f"{type(e).__name__}: {str(e)[:160]}")
-                    print(f"[api] session {chat.key[:8]}: its thread failed "
-                          f"({type(e).__name__}: {e}); starting a new one", flush=True)
-                    self.sessions.drop(chat.key)
+                last_err: Exception | None = None
+                for attempt in range(1, _CONTINUE_ATTEMPTS + 1):
+                    client = await self.get()
+                    gchat = client.start_chat(metadata=list(thread))
+                    try:
+                        t0 = time.monotonic()
+                        out = await asyncio.wait_for(
+                            client.generate_content(sent, chat=gchat, **_for_account(client, kwargs)),
+                            timeout=_CONTINUE_TIMEOUT_S,
+                        )
+                        metrics.note(gemini_s=round(time.monotonic() - t0, 2))
+                        self._log_turn(chat, "continued its thread", kwargs, started, sent)
+                        self.sessions.save(chat, gchat.metadata, self._account)
+                        return out
+                    except Exception as e:  # noqa: BLE001
+                        last_err = e
+                        if not isinstance(e, _THREAD_TRANSIENT):
+                            break
+                        if attempt < _CONTINUE_ATTEMPTS:
+                            self._count_retry()
+                            print(f"[api] session {chat.key[:8]}: continue attempt {attempt}/{_CONTINUE_ATTEMPTS} "
+                                  f"timed out/failed ({type(e).__name__}: {e}); retrying same thread", flush=True)
+                metrics.note(thread="continue_failed", thread_error=f"{type(last_err).__name__}: {str(last_err)[:160]}")
+                print(f"[api] session {chat.key[:8]}: its thread failed after {_CONTINUE_ATTEMPTS} attempts "
+                      f"({type(last_err).__name__}: {last_err}); starting a new one", flush=True)
+                self.sessions.drop(chat.key)
             m = metrics.current()
             if m is not None and m.thread != "continue_failed":
                 m.thread = "new"
@@ -315,28 +333,55 @@ class GeminiManager:
             client = await self._timed_get()
             thread = self.sessions.thread_for(chat, self._account)
             if thread is not None:
-                gchat = client.start_chat(metadata=thread)
                 sent = self._continuation(chat)
-                yielded = False
-                try:
-                    t0 = time.monotonic()
-                    async for out in client.generate_content_stream(
-                            sent, chat=gchat, **_for_account(client, kwargs)):
-                        if not yielded:
-                            metrics.note(first_chunk_s=round(time.monotonic() - t0, 2))
+                last_err: Exception | None = None
+                for attempt in range(1, _CONTINUE_ATTEMPTS + 1):
+                    client = await self.get()
+                    gchat = client.start_chat(metadata=list(thread))
+                    yielded = False
+                    agen = client.generate_content_stream(
+                        sent, chat=gchat, **_for_account(client, kwargs)
+                    ).__aiter__()
+                    try:
+                        t0 = time.monotonic()
+                        first = await asyncio.wait_for(agen.__anext__(), timeout=_CONTINUE_TIMEOUT_S)
+                        metrics.note(first_chunk_s=round(time.monotonic() - t0, 2))
                         yielded = True
-                        yield out
-                    metrics.note(gemini_s=round(time.monotonic() - t0, 2))
-                    self._log_turn(chat, "continued its thread", kwargs, started, sent)
-                    self.sessions.save(chat, gchat.metadata, self._account)
-                    return
-                except Exception as e:  # noqa: BLE001
-                    self.sessions.drop(chat.key)
-                    metrics.note(thread="continue_failed", thread_error=f"{type(e).__name__}: {str(e)[:160]}")
-                    if yielded:
-                        raise  # can't restart a reply the client has half-received
-                    print(f"[api] session {chat.key[:8]}: its thread failed "
-                          f"({type(e).__name__}: {e}); starting a new one", flush=True)
+                        yield first
+                        async for out in agen:
+                            yield out
+                        metrics.note(gemini_s=round(time.monotonic() - t0, 2))
+                        self._log_turn(chat, "continued its thread", kwargs, started, sent)
+                        self.sessions.save(chat, gchat.metadata, self._account)
+                        return
+                    except StopAsyncIteration:
+                        metrics.note(gemini_s=round(time.monotonic() - t0, 2))
+                        self._log_turn(chat, "continued its thread", kwargs, started, sent)
+                        self.sessions.save(chat, gchat.metadata, self._account)
+                        return
+                    except Exception as e:  # noqa: BLE001
+                        last_err = e
+                        if yielded:
+                            self.sessions.drop(chat.key)
+                            metrics.note(thread="continue_failed", thread_error=f"{type(e).__name__}: {str(e)[:160]}")
+                            raise  # can't restart a reply the client has half-received
+                        if not isinstance(e, _THREAD_TRANSIENT):
+                            break
+                        if attempt < _CONTINUE_ATTEMPTS:
+                            self._count_retry()
+                            print(f"[api] session {chat.key[:8]}: continue attempt {attempt}/{_CONTINUE_ATTEMPTS} "
+                                  f"timed out/failed ({type(e).__name__}: {e}); retrying same thread", flush=True)
+                    finally:
+                        aclose = getattr(agen, "aclose", None)
+                        if aclose is not None:
+                            try:
+                                await aclose()
+                            except Exception:  # noqa: BLE001
+                                pass
+                self.sessions.drop(chat.key)
+                metrics.note(thread="continue_failed", thread_error=f"{type(last_err).__name__}: {str(last_err)[:160]}")
+                print(f"[api] session {chat.key[:8]}: its thread failed after {_CONTINUE_ATTEMPTS} attempts "
+                      f"({type(last_err).__name__}: {last_err}); starting a new one", flush=True)
             m = metrics.current()
             if m is not None and m.thread != "continue_failed":
                 m.thread = "new"

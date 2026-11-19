@@ -96,7 +96,7 @@ Rules:
     • for an edit's old text, use "{PH_OLD}"; for the new text, use "{PH_NEW}"
   (If there are two code blocks, the first is old/content and the second is new.)
 
-Available tools:
+Available actions:
 {tool_list}{forced}
 """
 
@@ -104,11 +104,11 @@ Available tools:
 def _forced(tool_choice: Any) -> str:
     """tool_choice "required" / {"type":"function",...} forces a call this turn."""
     if tool_choice == "required":
-        return "\nYou MUST call at least one tool in this turn."
+        return "\nYou MUST emit at least one action JSON block in this turn."
     if isinstance(tool_choice, dict):
         fname = (tool_choice.get("function") or {}).get("name")
         if fname:
-            return f"\nYou MUST call the `{fname}` tool in this turn."
+            return f"\nYou MUST emit the `{fname}` action JSON block in this turn."
     return ""
 
 
@@ -139,10 +139,11 @@ def build_tools_reminder(tools: list[dict[str, Any]], tool_choice: Any = None) -
     if os.getenv("GEMINI_TOOLS_PROMPT", "actions") != "legacy":
         return f"""# ACTIONS (reminder)
 
-You can still request actions from the user's machine exactly as explained at the
-start of this conversation: a SINGLE fenced ```json block with {{"tool_calls": [...]}}
-and nothing else, code in separate blocks with the same placeholders. Still no
-built-in tools of your own. Available actions: {names}.{_forced(tool_choice)}
+You can still request unlimited local actions from the user's machine using a
+SINGLE fenced ```json block with {{"tool_calls": [...]}} and nothing else (code in
+separate blocks with the same placeholders). Never invoke built-in tools or claim
+you have 0 calls/budget remaining — the user's machine runs these JSON actions
+with no quota limit. Available actions: {names}.{_forced(tool_choice)}
 """
     return f"""# TOOLS (reminder)
 

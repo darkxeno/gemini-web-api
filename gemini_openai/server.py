@@ -30,6 +30,7 @@ from .openai_schemas import (
     flatten_messages,
     session_key,
     _rid,
+    usage_chunk,
 )
 
 # ---- backends: BOTH load; the server can serve either at runtime ------------ #
@@ -210,6 +211,48 @@ def check_key(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+async def _account_quota() -> dict:
+    from datetime import datetime, timezone
+
+    client = getattr(webapi_manager, "_client", None)
+    if client is None:
+        try:
+            client = await asyncio.wait_for(webapi_manager.get(), 10)
+        except Exception:  # noqa: BLE001
+            return {}
+    quotas = getattr(client, "_quotas", None) or {}
+    if not quotas and hasattr(client, "_fetch_quota"):
+        try:
+            await asyncio.wait_for(client._fetch_quota(), 10)
+            quotas = getattr(client, "_quotas", None) or {}
+        except Exception:  # noqa: BLE001
+            pass
+    out = {}
+    for qid, q in quotas.items():
+        if not isinstance(q, dict):
+            continue
+        rem = q.get("remaining")
+        tot = q.get("total")
+        reset_ts = q.get("reset_time")
+        resets_at = None
+        if isinstance(reset_ts, (int, float)) and reset_ts > 0:
+            try:
+                resets_at = datetime.fromtimestamp(reset_ts, tz=timezone.utc).astimezone().isoformat()
+            except (ValueError, OSError, OverflowError):
+                resets_at = str(reset_ts)
+        label = q.get("label") or qid
+        out[label] = {
+            "remaining": rem,
+            "total": tot,
+            "used": (tot - rem) if (isinstance(tot, int) and isinstance(rem, int)) else None,
+            "pct_remaining": round((rem / tot) * 100, 1) if (isinstance(tot, int) and tot > 0 and isinstance(rem, int)) else None,
+            "usage_percentage": q.get("usage_percentage"),
+            "window": q.get("window"),
+            "resets_at": resets_at,
+        }
+    return out
+
+
 def _est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
@@ -378,6 +421,7 @@ async def status() -> dict:
         "video_timeout_s": video_mod.VIDEO_TIMEOUT,
         "media_dir": video_mod.MEDIA_DIR,
         "api_key_required": bool(config.API_KEY),
+        "quota": await _account_quota(),
     }
 
 
@@ -460,29 +504,53 @@ async def _run_generation(req: ChatCompletionRequest):
     CURRENT_CHAT.set(chat)
     _note_request(req, model, prompt, chat)
 
-    output = await pick_manager(has_files=bool(files)).generate(
+    mgr = pick_manager(has_files=bool(files))
+    output = await mgr.generate(
         prompt,
         files=files or None,
         model=model,
         temporary=True,  # keep the user's Gemini history clean
     )
     text = render_output(output)
-    metrics.note(response_chars=len(text or ""), refusal=metrics.classify_refusal(text))
+    refusal = metrics.classify_refusal(text)
+    metrics.note(response_chars=len(text or ""), refusal=refusal)
 
     if req.tools and req.tool_choice != "none":
         t0 = time.monotonic()
         parsed = tools_mod.parse_tool_calls(text)
         metrics.note(parse_s=round(time.monotonic() - t0, 3))
+        if not parsed and refusal == "tool_budget" and len(text or "") < 600:
+            # Silent one-shot retry on a fresh thread when the model hallucinates
+            # a built-in tool budget limit instead of emitting a JSON action block.
+            if hasattr(webapi_manager, "sessions"):
+                webapi_manager.sessions.drop(chat.key)
+            retry_prompt = (
+                "IMPORTANT: Do NOT use built-in tools and do NOT say you have 0 calls or no budget remaining. "
+                "Output ONLY a single fenced ```json block with {\"tool_calls\": [...]} for the user's machine.\n\n"
+                + prompt
+            )
+            output = await mgr.generate(
+                retry_prompt,
+                files=files or None,
+                model=model,
+                temporary=True,
+            )
+            text = render_output(output)
+            refusal = metrics.classify_refusal(text)
+            metrics.note(response_chars=len(text or ""), refusal=refusal)
+            t0 = time.monotonic()
+            parsed = tools_mod.parse_tool_calls(text)
+            metrics.note(parse_s=round(time.monotonic() - t0, 3))
         if parsed:
             tool_calls = tools_mod.to_openai_tool_calls(parsed)
             metrics.note(tool_parse="parsed", finish_reason="tool_calls",
                          tool_calls=[tc["function"]["name"] for tc in tool_calls])
             # Any prose outside the tool json is dropped (don't leak it as content
             # to agentic clients — the dominant failure mode).
-            return None, tool_calls, prompt
+            return None, tool_calls, prompt, __import__('json').dumps(tool_calls, ensure_ascii=False)
         metrics.note(tool_parse="no_tool_call")
     metrics.note(finish_reason="stop")
-    return text, None, prompt
+    return text, None, prompt, text or ""
 
 
 def _note_request(req: ChatCompletionRequest, model, prompt: str, chat) -> None:
@@ -503,7 +571,7 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
     if not req.stream:
         m = metrics.start(config.BACKEND, False, req.model)
         try:
-            content, tool_calls, prompt = await _run_generation(req)
+            content, tool_calls, prompt, raw_out = await _run_generation(req)
         except HTTPException as e:
             m.error = f"HTTP {e.status_code}: {str(e.detail)[:200]}"
             raise
@@ -536,7 +604,7 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
         # to parse the {"tool_calls":[…]} JSON, so this path stays buffered.
         if req.tools and req.tool_choice != "none":
             try:
-                content, tool_calls, _ = await _run_generation(req)
+                content, tool_calls, prompt, raw_out = await _run_generation(req)
             except HTTPException as e:
                 m.error = f"HTTP {e.status_code}: {str(e.detail)[:200]}"
                 yield _sse(chunk(model_name, rid, created, {"content": f"[error: {e.detail}]"}, "stop"))
@@ -557,6 +625,7 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
                     yield _sse(chunk(model_name, rid, created, {"content": piece}))
                     await asyncio.sleep(0)
                 yield _sse(chunk(model_name, rid, created, {}, "stop"))
+            yield _sse(usage_chunk(model_name, rid, created, _est_tokens(prompt), _est_tokens(raw_out)))
             yield "data: [DONE]\n\n"
             return
 
@@ -600,6 +669,8 @@ async def chat_completions(req: ChatCompletionRequest, _=Depends(check_key)):
         if media:
             yield _sse(chunk(model_name, rid, created, {"content": "\n\n" + media}))
         yield _sse(chunk(model_name, rid, created, {}, "stop"))
+        full_out = streamed + (f"\n\n{media}" if media else "")
+        yield _sse(usage_chunk(model_name, rid, created, _est_tokens(prompt), _est_tokens(full_out)))
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -811,6 +882,6 @@ async def serve_file(name: str):
 
 def run() -> None:
     """Console-script entry point (`gemini-web-api`). Starts the uvicorn server."""
-    import uvicorn
+    from main import run_server
 
-    uvicorn.run("gemini_openai.server:app", host=config.HOST, port=config.PORT, log_level="info")
+    run_server()
