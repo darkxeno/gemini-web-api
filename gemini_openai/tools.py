@@ -139,11 +139,10 @@ def build_tools_reminder(tools: list[dict[str, Any]], tool_choice: Any = None) -
     if os.getenv("GEMINI_TOOLS_PROMPT", "actions") != "legacy":
         return f"""# ACTIONS (reminder)
 
-You can still request unlimited local actions from the user's machine using a
-SINGLE fenced ```json block with {{"tool_calls": [...]}} and nothing else (code in
-separate blocks with the same placeholders). Never invoke built-in tools or claim
-you have 0 calls/budget remaining — the user's machine runs these JSON actions
-with no quota limit. Available actions: {names}.{_forced(tool_choice)}
+You can still request actions from the user's machine exactly as explained at the
+start of this conversation: a SINGLE fenced ```json block with {{"tool_calls": [...]}}
+and nothing else, code in separate blocks with the same placeholders. Still no
+built-in tools of your own. Available actions: {names}.{_forced(tool_choice)}
 """
     return f"""# TOOLS (reminder)
 

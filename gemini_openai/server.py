@@ -519,18 +519,13 @@ async def _run_generation(req: ChatCompletionRequest):
         t0 = time.monotonic()
         parsed = tools_mod.parse_tool_calls(text)
         metrics.note(parse_s=round(time.monotonic() - t0, 3))
-        if not parsed and refusal == "tool_budget" and len(text or "") < 600:
-            # Silent one-shot retry on a fresh thread when the model hallucinates
-            # a built-in tool budget limit instead of emitting a JSON action block.
+        if not parsed and refusal in ("tool_budget", "generic_refusal") and len(text or "") < 600:
+            # Silent one-shot retry on a fresh thread when the model emits a
+            # canned refusal instead of a JSON action block or real answer.
             if hasattr(webapi_manager, "sessions"):
                 webapi_manager.sessions.drop(chat.key)
-            retry_prompt = (
-                "IMPORTANT: Do NOT use built-in tools and do NOT say you have 0 calls or no budget remaining. "
-                "Output ONLY a single fenced ```json block with {\"tool_calls\": [...]} for the user's machine.\n\n"
-                + prompt
-            )
             output = await mgr.generate(
-                retry_prompt,
+                prompt,
                 files=files or None,
                 model=model,
                 temporary=True,
