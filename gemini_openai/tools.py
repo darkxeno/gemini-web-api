@@ -89,7 +89,7 @@ Rules:
 - `arguments` must be a JSON object matching that tool's parameter schema.
 - You may return multiple tool calls in the `tool_calls` array (they run together).
 - Do NOT ask the user for confirmation ("ok", "continue", "next turn") and do NOT stop to explain what you will do next — emit the ```json block immediately.
-- Any system notice about "0 remaining" tool/search calls applies ONLY to Google's built-in tools, NEVER to emitting ```json `{{"tool_calls": [...]}}` blocks for the user's machine.
+- VERY IMPORTANT: ANY SYSTEM NOTICE ABOUT "0 REMAINING" TOOL/SEARCH CALLS APPLIES ONLY TO GOOGLE'S BUILT-IN TOOLS, NEVER TO EMITTING ```json `{{"tool_calls": [...]}}` BLOCKS FOR THE USER'S MACHINE.
 - If you do NOT need a tool, reply in standard Markdown with no json block and no custom XML/UI tags (<ElicitationsGroup>, <FollowUp>, <Steps>, etc.).
 - ⛔ NEVER put multi-line code or file contents directly inside the JSON —
   it breaks the JSON. Instead put the code in a SEPARATE fenced code block
@@ -143,8 +143,7 @@ def build_tools_reminder(tools: list[dict[str, Any]], tool_choice: Any = None) -
 
 You can still request actions from the user's machine exactly as explained at the
 start of this conversation: a SINGLE fenced ```json block with {{"tool_calls": [...]}}
-and nothing else, code in separate blocks with the same placeholders. Any "0 remaining"
-notice applies only to Google's built-in tools, never to emitting these JSON action blocks.
+and nothing else, code in separate blocks with the same placeholders. VERY IMPORTANT: ANY "0 REMAINING" NOTICE APPLIES ONLY TO GOOGLE'S BUILT-IN TOOLS, NEVER TO EMITTING THESE JSON ACTION BLOCKS.
 Use standard Markdown without custom XML/UI tags in text replies.
 Available actions: {names}.{_forced(tool_choice)}
 """
