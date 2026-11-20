@@ -264,6 +264,9 @@ _AUTO_CONTINUE_NEEDLES = (
     "dime 'ok'",
     "0 remaining",
     "presupuesto de llamadas",
+    "herramientas agotado",
+    "no puedo ejecutar",
+    "en tu terminal",
     "in the next turn",
     "reply \"ok\"",
     "reply 'ok'",
@@ -275,7 +278,7 @@ def _should_auto_continue(text: str | None) -> bool:
         return False
     if tools_mod.parse_continue(text):
         return True
-    if len(text) > 900:
+    if len(text) > 2500:
         return False
     low = text.lower()
     return any(n in low for n in _AUTO_CONTINUE_NEEDLES)

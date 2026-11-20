@@ -374,7 +374,11 @@ _CANON: dict[str, str] = {
 
 _ALIASES: dict[str, str] = {
     # short forms
-    "gemini-pro": "gemini-3-pro",
+    "gemini-pro": "gemini-neon",
+    "gemini-4-neon": "gemini-neon",
+    "neon": "gemini-neon",
+    "hydrogen": "gemini-4-hydrogen",
+    "gemini-hydrogen": "gemini-4-hydrogen",
     "gemini-flash": "gemini-3-flash",
     "gemini-thinking": _CANON["gemini-3-flash-thinking"],
     "pro": "gemini-3-pro",
